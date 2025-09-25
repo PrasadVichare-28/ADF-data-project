@@ -1,0 +1,67 @@
+{
+  "name": "PL_Copy_GitHub_to_ADLS_Dates",
+  "type": "Microsoft.DataFactory/factories/pipelines",
+  "properties": {
+    "parameters": {
+      "owner": {
+        "type": "String"
+      },
+      "repo": {
+        "type": "String"
+      },
+      "branch": {
+        "type": "String"
+      },
+      "filesystem": {
+        "type": "String"
+      },
+      "dateList": {
+        "type": "Array"
+      }
+    },
+    "activities": [
+      {
+        "name": "ForEachDate",
+        "type": "ForEach",
+        "typeProperties": {
+          "items": "@pipeline().parameters.dateList",
+          "activities": [
+            {
+              "name": "CopyCSV",
+              "type": "Copy",
+              "typeProperties": {
+                "source": {
+                  "type": "HttpSource"
+                },
+                "sink": {
+                  "type": "DelimitedTextSink"
+                }
+              },
+              "inputs": [
+                {
+                  "referenceName": "DS_GitHub_Transactions_CSV",
+                  "type": "DatasetReference",
+                  "parameters": {
+                    "yyyymmdd": "@{item()}"
+                  }
+                }
+              ],
+              "outputs": [
+                {
+                  "referenceName": "DS_ADLS_Transactions_CSV",
+                  "type": "DatasetReference",
+                  "parameters": {
+                    "filesystem": "@{pipeline().parameters.filesystem}",
+                    "yyyy": "@{substring(item(),0,4)}",
+                    "mm": "@{substring(item(),4,2)}",
+                    "dd": "@{substring(item(),6,2)}"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
