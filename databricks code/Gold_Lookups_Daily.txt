@@ -1,0 +1,102 @@
+from pyspark.sql import functions as F, types as T
+
+# widgets (set in Job/ADF)
+dbutils.widgets.text("adls_auth_type", "sas")        # sas | account_key
+dbutils.widgets.text("adls_secret", "")              # SAS without '?', or account key
+dbutils.widgets.text("yyyymmdd", "")                 # leave blank -> yesterday America/Chicago
+
+auth_type = dbutils.widgets.get("adls_auth_type")
+secret    = dbutils.widgets.get("adls_secret")
+yyyymmdd  = dbutils.widgets.get("yyyymmdd")
+
+# default yyyymmdd if blank (America/Chicago)
+from datetime import datetime, timedelta
+import pytz
+if not yyyymmdd:
+    tz = pytz.timezone("America/Chicago")
+    yyyymmdd = (datetime.now(tz) - timedelta(days=1)).strftime("%Y%m%d")
+
+yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+
+account   = "azmlstoragedatalake"
+container = "raw"
+
+def set_adls_conf():
+    if auth_type == "sas":
+        spark.conf.set(f"fs.azure.sas.token.provider.type.{account}.dfs.core.windows.net", "org.apache.hadoop.fs.azurebfs.sas.FixedSASTokenProvider")
+        spark.conf.set(f"fs.azure.sas.fixed.token.{account}.dfs.core.windows.net", secret)
+    elif auth_type == "account_key":
+        spark.conf.set(f"fs.azure.account.key.{account}.dfs.core.windows.net", secret)
+    else:
+        raise Exception("Unsupported adls_auth_type")
+
+set_adls_conf()
+
+silver_path = f"abfss://{container}@{account}.dfs.core.windows.net/silver/transactions"
+lookup_cust_path = f"abfss://{container}@{account}.dfs.core.windows.net/gold/lookup_cust_amount_stats"
+lookup_term_path = f"abfss://{container}@{account}.dfs.core.windows.net/gold/lookup_term_7d"
+
+
+from datetime import datetime, timedelta
+
+day_dt = datetime.strptime(yyyymmdd, "%Y%m%d")
+start30 = (day_dt - timedelta(days=31)).strftime("%Y-%m-%d")  # 30 full days before *today*
+start8  = (day_dt - timedelta(days=8)).strftime("%Y-%m-%d")   # 7 days before *yesterday*
+end0    = day_dt.strftime("%Y-%m-%d")                         # exclusive end for customer stats
+end1    = (day_dt + timedelta(days=1)).strftime("%Y-%m-%d")   # exclusive end for terminal stats
+
+silver = spark.read.format("delta").load(silver_path)
+
+# for customer 30d stats (up to start of current day)
+hist_cust = (silver
+   .where((F.col("TX_DATETIME") >= F.to_timestamp(F.lit(start30+" 00:00:00"))) &
+          (F.col("TX_DATETIME") <  F.to_timestamp(F.lit(end0   +" 00:00:00"))))
+   .select("CUSTOMER_ID", F.col("TX_AMOUNT").cast("double").alias("TX_AMOUNT_D"))
+)
+
+# for terminal 7d stats (up to end of current day)
+hist_term = (silver
+   .where((F.col("TX_DATETIME") >= F.to_timestamp(F.lit(start8+" 00:00:00"))) &
+          (F.col("TX_DATETIME") <  F.to_timestamp(F.lit(end1+" 00:00:00"))))
+   .select("TERMINAL_ID","TX_FRAUD","TX_DATETIME")
+)
+
+
+# Customer 30d stats
+cust_stats = (hist_cust.groupBy("CUSTOMER_ID")
+  .agg(
+    F.expr("percentile_approx(TX_AMOUNT_D, 0.5, 1000)").alias("cust_amt_med_30d"),
+    (F.expr("percentile_approx(TX_AMOUNT_D, 0.75, 1000)") -
+     F.expr("percentile_approx(TX_AMOUNT_D, 0.25, 1000)")).alias("cust_amt_iqr_30d")
+  )
+  .withColumn("as_of_date", F.lit(yyyymmdd))
+  .withColumn("yyyy", F.lit(int(yyyy))).withColumn("mm", F.lit(int(mm))).withColumn("dd", F.lit(int(dd)))
+)
+
+# Terminal 7d stats (average daily fraud rate, total txns over 7d window)
+term_day = (hist_term
+   .withColumn("day", F.to_date("TX_DATETIME"))
+   .groupBy("TERMINAL_ID","day")
+   .agg(F.mean("TX_FRAUD").alias("term_fraud_rate_day"),
+        F.count("*").alias("term_txn_day"))
+)
+term_stats = (term_day
+   .groupBy("TERMINAL_ID")
+   .agg(F.mean("term_fraud_rate_day").alias("term_fraud_rate_7d"),
+        F.sum("term_txn_day").alias("term_txn_7d"))
+   .withColumn("as_of_date", F.lit(yyyymmdd))
+   .withColumn("yyyy", F.lit(int(yyyy))).withColumn("mm", F.lit(int(mm))).withColumn("dd", F.lit(int(dd)))
+)
+
+
+(cust_stats.write.format("delta").mode("overwrite")
+  .option("replaceWhere", f"yyyy='{yyyy}' AND mm='{mm}' AND dd='{dd}'")
+  .save(lookup_cust_path))
+
+(term_stats.write.format("delta").mode("overwrite")
+  .option("replaceWhere", f"yyyy='{yyyy}' AND mm='{mm}' AND dd='{dd}'")
+  .save(lookup_term_path))
+
+print(f"[Lookups] Wrote as_of={yyyymmdd}")
+
+

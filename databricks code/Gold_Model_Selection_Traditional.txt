@@ -1,0 +1,313 @@
+# ----- widgets -----
+dbutils.widgets.text("adls_auth_type", "sas")   # "sas" | "account_key"
+dbutils.widgets.text("adls_secret", "")         # paste SAS (no leading '?') or account key
+dbutils.widgets.text("gold_start", "20250101")  # first day in Gold
+dbutils.widgets.text("gold_end",   "20250114")  # last day in Gold
+dbutils.widgets.text("holdout_days", "3")       # keep last N days as final holdout (e.g., 1–2)
+
+auth_type   = dbutils.widgets.get("adls_auth_type").strip().lower()
+adls_secret = dbutils.widgets.get("adls_secret").strip().lstrip("?")
+gold_start  = dbutils.widgets.get("gold_start").strip()
+gold_end    = dbutils.widgets.get("gold_end").strip()
+holdout_n   = int(dbutils.widgets.get("holdout_days"))
+
+if not adls_secret:
+    raise Exception("Missing ADLS secret in 'adls_secret'.")
+
+account   = "azmlstoragedatalake"
+container = "raw"
+g_path    = f"abfss://{container}@{account}.dfs.core.windows.net/gold/features_daily"
+model_path = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1"
+meta_path  = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1_meta"  # small JSON/Delta
+
+# ----- ADLS auth -----
+if auth_type == "sas":
+    spark.conf.set("fs.azure.sas.token.provider.type", "org.apache.hadoop.fs.azurebfs.sas.FixedSASTokenProvider")
+    spark.conf.set(f"fs.azure.sas.fixed.token.{account}.dfs.core.windows.net", adls_secret)
+elif auth_type == "account_key":
+    spark.conf.set(f"fs.azure.account.key.{account}.dfs.core.windows.net", adls_secret)
+else:
+    raise ValueError("adls_auth_type must be 'sas' or 'account_key'")
+print("[Auth] OK")
+
+from pyspark.sql import functions as F
+
+g_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/features_daily"
+gold = spark.read.format("delta").load(g_path)
+
+# Robust ymd (works if yyyy/mm/dd are int or string, padded or not)
+gold = (gold
+    .withColumn("yyyy_s", F.lpad(F.col("yyyy").cast("string"), 4, "0"))
+    .withColumn("mm_s",   F.lpad(F.col("mm").cast("string"),   2, "0"))
+    .withColumn("dd_s",   F.lpad(F.col("dd").cast("string"),   2, "0"))
+    .withColumn("ymd",    F.concat("yyyy_s","mm_s","dd_s"))
+)
+
+gold = gold.where((F.col("ymd") >= gold_start) & (F.col("ymd") <= gold_end))
+
+# Cast boolean to numeric
+gold = gold.withColumn("is_weekend", F.col("is_weekend").cast("double"))
+
+# Basic sanity
+gold.groupBy("TX_FRAUD").count().show()
+print("Rows:", gold.count())
+
+from pyspark.sql import functions as F
+
+label_col = "TX_FRAUD"
+features = [
+    "TX_AMOUNT_D","distance_km","hour_of_day","day_of_week","is_weekend",
+    "cust_txn_2m","cust_txn_5m",
+    "term_fraud_rate_7d","term_txn_7d",
+    "cust_amt_med_30d","cust_amt_iqr_30d","amt_vs_med"
+]
+
+df_ml = gold.select(
+    F.col(label_col).cast("int").alias(label_col),
+    *[F.col(c).cast("double").alias(c) for c in features],
+    "ymd"
+)
+
+# Clean NaNs/Nulls: fill by medians per column
+stats = (df_ml.agg(*[F.expr(f"percentile_approx({c}, 0.5, 1000)").alias(c) for c in features]).first().asDict())
+fill_map = {c: (stats[c] if stats[c] is not None else 0.0) for c in features}
+for c in features:
+    df_ml = df_ml.withColumn(c, F.when(~(F.isnan(c) | F.col(c).isNull()), F.col(c)).otherwise(None))
+df_ml = df_ml.na.fill(fill_map)
+
+
+holdout_n = 5
+days = [r["ymd"] for r in df_ml.select("ymd").distinct().orderBy("ymd").collect()]
+assert len(days) >= (2 + holdout_n), "Not enough days to build folds."
+
+holdout_days = days[-holdout_n:]
+dev_days     = days[:-holdout_n]  # for folds
+
+# Example: rolling folds where the validation day slides forward
+folds = []
+for i in range(1, len(dev_days)):  # start with at least 1 day of train
+    train_days = dev_days[:i]       # from first up to i-1
+    valid_day  = dev_days[i]        # the i-th day as validation
+    folds.append((train_days, valid_day))
+
+print("Folds:", len(folds), "Holdout:", holdout_days)
+
+
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.functions import vector_to_array 
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier, GBTClassifier
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+import numpy as np
+
+# distinct name for the assembler
+va_asm = VectorAssembler(inputCols=features, outputCol="features", handleInvalid="keep")
+
+def fit_predict(train_df, valid_df, algo_base, params, assembler):
+    # clone the base algo with params
+    if isinstance(algo_base, LogisticRegression):
+        # simple class weighting
+        fr = train_df.agg(F.mean(label_col)).first()[0] or 0.001
+        pos_w = float((1.0 - fr) / max(fr, 1e-6))
+        train_df = train_df.withColumn("weight", F.when(F.col(label_col)==1, pos_w).otherwise(1.0))
+        algo = LogisticRegression(labelCol=label_col, featuresCol="features", weightCol="weight", **params)
+    elif isinstance(algo_base, RandomForestClassifier):
+        algo = RandomForestClassifier(labelCol=label_col, featuresCol="features", **params)
+    else:
+        algo = GBTClassifier(labelCol=label_col, featuresCol="features", **params)
+
+    pipe = Pipeline(stages=[assembler, algo])
+    model = pipe.fit(train_df)
+    pred  = (model.transform(valid_df)
+             .select(
+                 label_col,
+                 vector_to_array("probability").getItem(1).alias("p")  # <-- changed
+             ))
+    return model, pred
+
+def metrics_from_pred(pred_sdf, ks=[100]):
+    pdf = pred_sdf.toPandas()
+    if len(pdf)==0 or pdf[label_col].sum()==0:
+        return {"pr_auc":0.0,"roc_auc":0.0,"recall_at_fpr005":0.0, **{f"p_at_{k}":0.0 for k in ks}}
+
+    y = pdf[label_col].astype(int).values
+    p = pdf["p"].astype(float).values
+    try:
+        from sklearn import metrics as skm
+        pr_auc  = skm.average_precision_score(y, p)
+        roc_auc = skm.roc_auc_score(y, p)
+        fpr, tpr, thr = skm.roc_curve(y, p)
+        target = 0.005
+        ok = np.where(fpr <= target)[0]
+        rec_at = (tpr[ok].max() if len(ok) else 0.0)
+    except Exception:
+        pr_auc = roc_auc = rec_at = 0.0
+
+    out = {}
+    order = np.argsort(-p)
+    for k in ks:
+        kk = min(k, len(y))
+        out[f"p_at_{k}"] = float(y[order][:kk].sum()/kk) if kk>0 else 0.0
+
+    return {"pr_auc":float(pr_auc), "roc_auc":float(roc_auc), "recall_at_fpr005":float(rec_at), **out}
+
+def choose_threshold_for_fpr(pred_sdf, fpr_cap=0.005):
+    pdf = pred_sdf.toPandas()
+    if len(pdf)==0: return 0.5
+    from sklearn import metrics as skm
+    y  = pdf[label_col].astype(int).values
+    p  = pdf["p"].astype(float).values
+    fpr, tpr, thr = skm.roc_curve(y, p)
+    ok = np.where(fpr <= fpr_cap)[0]
+    if len(ok)==0:
+        return 0.99
+    best_idx = ok[np.argmax(tpr[ok])]
+    return float(thr[best_idx])
+
+
+from collections import defaultdict
+
+candidates = [
+    ("LR",  LogisticRegression(), [{"regParam": r} for r in [0.0, 0.01, 0.1]]),
+    ("RF",  RandomForestClassifier(), [{"numTrees": n, "maxDepth": d} for n in [100] for d in [6,10]]),
+    ("GBT", GBTClassifier(), [{"maxDepth": d, "maxIter": it} for d in [5,7] for it in [50]])
+]
+
+fold_results = []
+val_preds_by_model = defaultdict(list)
+
+for (algo_name, base_algo, grid) in candidates:
+    for params in grid:
+        fold_metrics = []
+        for train_days, valid_day in folds:
+            train_df = df_ml.where(F.col("ymd").isin(train_days))
+            val_df   = df_ml.where(F.col("ymd")==valid_day)
+
+            # ensure validation has at least 1 positive
+            if val_df.filter(F.col(label_col)==1).limit(1).count()==0:
+                continue
+
+            model, va_pred = fit_predict(train_df, val_df, base_algo, params, assembler=va_asm)
+            m = metrics_from_pred(va_pred, ks=[100])
+            fold_metrics.append(m)
+            val_preds_by_model[(algo_name, str(params))].append(va_pred)
+
+        if fold_metrics:
+            agg = {k: float(np.mean([fm[k] for fm in fold_metrics])) for k in fold_metrics[0].keys()}
+            fold_results.append({"model": algo_name, "params": str(params), **agg})
+
+import pandas as pd
+res_df = pd.DataFrame(fold_results).sort_values("pr_auc", ascending=False).reset_index(drop=True)
+display(res_df.head(10))  # or print if not in notebook
+best = res_df.iloc[0].to_dict()
+best_model_name = best["model"]
+best_params     = eval(best["params"])
+print("Best:", best_model_name, best_params)
+
+# --- Section 6: Freeze a single threshold from all validation predictions ---
+from pyspark.sql import functions as F
+import numpy as np
+from sklearn import metrics as skm
+
+# Recreate the key used in the fold loop:
+key = (best_model_name, str(best_params))
+
+# Combine all validation predictions for the chosen model into one DataFrame
+agg_val_pred = None
+for sdf in val_preds_by_model[key]:
+    agg_val_pred = sdf if agg_val_pred is None else agg_val_pred.unionByName(sdf)
+
+if agg_val_pred is None or agg_val_pred.limit(1).count() == 0:
+    raise Exception("No validation predictions found for the best model/params. Re-run Sections 0–5.")
+
+# Choose threshold with FPR cap
+pdf = agg_val_pred.toPandas()
+y  = pdf["TX_FRAUD"].astype(int).values
+p  = pdf["p"].astype(float).values
+fpr, tpr, thr = skm.roc_curve(y, p)
+cap = 0.005  # 0.5%
+ok = np.where(fpr <= cap)[0]
+if len(ok)==0:
+    chosen_thr = 0.99
+else:
+    best_idx = ok[np.argmax(tpr[ok])]
+    chosen_thr = float(thr[best_idx])
+
+print("Chosen threshold (FPR<=0.5% on validation):", chosen_thr)
+
+
+# --- Section 7: Final fit on dev days, evaluate on holdout ---
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier, GBTClassifier
+from pyspark.ml import Pipeline
+from pyspark.ml.functions import vector_to_array
+
+# Assembler must match training
+va_asm = VectorAssembler(inputCols=features, outputCol="features", handleInvalid="keep")
+
+dev_df  = df_ml.where(F.col("ymd").isin(dev_days))
+test_df = df_ml.where(F.col("ymd").isin(holdout_days))
+
+# Rebuild the chosen estimator
+if best_model_name == "LR":
+    fr = dev_df.agg(F.mean("TX_FRAUD")).first()[0] or 0.001
+    pos_w = float((1.0 - fr) / max(fr, 1e-6))
+    algo = LogisticRegression(labelCol="TX_FRAUD", featuresCol="features", weightCol="weight", **best_params)
+    dev_df = dev_df.withColumn("weight", F.when(F.col("TX_FRAUD")==1, pos_w).otherwise(1.0))
+elif best_model_name == "RF":
+    algo = RandomForestClassifier(labelCol="TX_FRAUD", featuresCol="features", **best_params)
+else:
+    algo = GBTClassifier(labelCol="TX_FRAUD", featuresCol="features", **best_params)
+
+pipe = Pipeline(stages=[va_asm, algo])
+final_model = pipe.fit(dev_df)
+
+# Holdout evaluation (at chosen threshold)
+test_pred = (final_model.transform(test_df)
+             .select("TX_FRAUD", vector_to_array("probability").getItem(1).alias("p")))
+pdf = test_pred.toPandas()
+if len(pdf):
+    from sklearn import metrics as skm
+    y = pdf["TX_FRAUD"].astype(int).values
+    p = pdf["p"].astype(float).values
+    # headline metrics
+    pr_auc  = float(skm.average_precision_score(y, p)) if y.sum()>0 else 0.0
+    roc_auc = float(skm.roc_auc_score(y, p)) if len(np.unique(y))>1 else 0.5
+    yhat = (p >= chosen_thr).astype(int)
+    tp = int(((y==1)&(yhat==1)).sum()); fp = int(((y==0)&(yhat==1)).sum())
+    fn = int(((y==1)&(yhat==0)).sum()); pos = int((y==1).sum())
+    precision = tp / max(tp+fp,1)
+    recall    = tp / max(pos,1)
+else:
+    pr_auc = roc_auc = precision = recall = 0.0
+
+print("[HOLDOUT]", {"pr_auc":round(pr_auc,4), "roc_auc":round(roc_auc,4),
+                   "precision@thr":round(precision,4), "recall@thr":round(recall,4)})
+
+
+# --- Section 8: Save model + metadata to ADLS ---
+account   = "azmlstoragedatalake"
+container = "raw"
+model_path = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1"
+meta_path  = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1_meta"
+
+# 1) Spark PipelineModel
+final_model.write().overwrite().save(model_path)
+
+# 2) Metadata row: model, params, threshold, features
+meta_df = spark.createDataFrame(
+    [(best_model_name, str(best_params), float(chosen_thr), ",".join(features))],
+    "model string, params string, threshold double, features string"
+)
+(meta_df.write.mode("overwrite").format("delta").save(meta_path))
+
+print("[Saved] model ->", model_path)
+print("[Saved] meta  ->", meta_path)
+
+# sanity: can we load back?
+from pyspark.ml.pipeline import PipelineModel
+test_load = PipelineModel.load(model_path)
+meta_loaded = spark.read.format("delta").load(meta_path).limit(1).collect()[0].asDict()
+print("Meta loaded:", meta_loaded)
+
+

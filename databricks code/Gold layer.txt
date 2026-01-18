@@ -1,0 +1,350 @@
+xspark.conf.set(
+    "fs.azure.account.key.azmlstoragedatalake.dfs.core.windows.net",
+    "9QTdwB1LF0OdYHEeQO/m1KdriqEHVoqruUyHHtS2WNNaFRUiYmpAnlPXgTkukBHMwSf8B3BQgxbQ+AStpuBZNw=="
+)
+
+from pyspark.sql import functions as F, types as T, Window
+
+# ---------- params ----------
+dbutils.widgets.text("yyyymmdd", "20250101")
+yyyymmdd = dbutils.widgets.get("yyyymmdd")
+yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+
+gold_features_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/features_daily"
+
+# ---------- load one day from Silver ----------
+tx = (spark.read.format("delta")
+      .load("abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions")
+      .where( (F.col("yyyy")==yyyy) & (F.col("mm")==mm) & (F.col("dd")==dd) )
+)
+
+if tx.limit(1).count() == 0:
+    dbutils.notebook.exit(f"No silver rows for {yyyymmdd}")
+
+# Ensure types
+tx = (tx
+  .withColumn("event_time", F.col("event_time"))
+  .withColumn("TX_AMOUNT_D", F.col("TX_AMOUNT").cast("double"))
+)
+
+# ---------- velocity features (customer) ----------
+# Use time-range windows: last N seconds relative to current row
+# For rangeBetween with timestamps, convert to long seconds
+tx = tx.withColumn("_ts", F.col("event_time").cast("timestamp").cast("long"))
+
+w2m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-120, -1)
+w5m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-300, -1)
+
+tx = (tx
+  .withColumn("cust_txn_2m", F.count("*").over(w2m))
+  .withColumn("cust_txn_5m", F.count("*").over(w5m))
+)
+
+# ---------- terminal risk over rolling 7 days ----------
+# Build a 7-day historical window by reading last 8 days of Silver (this day + lookback)
+from datetime import datetime, timedelta
+import pandas as pd
+
+day_dt = datetime.strptime(yyyymmdd, "%Y%m%d")
+lookback_start = (day_dt - timedelta(days=8)).strftime("%Y/%m/%d")  # extra buffer
+silver_root = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+
+hist = (spark.read.format("delta").load(silver_root)
+        .where(
+          (F.col("TX_DATETIME") >= F.to_timestamp(F.lit((day_dt - timedelta(days=8)).strftime("%Y-%m-%d") + " 00:00:00")))
+          & (F.col("TX_DATETIME") <  F.to_timestamp(F.lit((day_dt + timedelta(days=1)).strftime("%Y-%m-%d") + " 00:00:00")))
+        )
+        .select("TERMINAL_ID","TX_FRAUD","TX_DATETIME")
+        .withColumn("event_time", F.col("TX_DATETIME"))
+)
+
+# terminal rolling 7-day aggregates keyed by (TERMINAL_ID, day)
+term_day = (hist
+  .withColumn("day", F.to_date("event_time"))
+  .groupBy("TERMINAL_ID","day")
+  .agg(F.mean("TX_FRAUD").alias("term_fraud_rate_day"),
+       F.count("*").alias("term_txn_day"))
+)
+
+# cumulate last 7 days at transaction time by joining 7-day frame
+# Simpler approximation: compute 7-day window ending "yesterday"
+end_day = F.to_date(F.lit(day_dt.strftime("%Y-%m-%d")))
+start_day = F.date_sub(end_day, 7)
+
+term_7d = (term_day
+  .where( (F.col("day")>=start_day) & (F.col("day")<end_day) )
+  .groupBy("TERMINAL_ID")
+  .agg(F.mean("term_fraud_rate_day").alias("term_fraud_rate_7d"),
+       F.sum("term_txn_day").alias("term_txn_7d"))
+)
+
+tx = tx.join(term_7d, on="TERMINAL_ID", how="left")\
+       .fillna({"term_fraud_rate_7d":0.0, "term_txn_7d":0})
+
+# ---------- customer amount stats (30-day) ----------
+hist_cust = (spark.read.format("delta").load(silver_root)
+             .where(
+               (F.col("TX_DATETIME") >= F.to_timestamp(F.lit((day_dt - timedelta(days=31)).strftime("%Y-%m-%d") + " 00:00:00")))
+               & (F.col("TX_DATETIME") <  F.to_timestamp(F.lit(day_dt.strftime("%Y-%m-%d") + " 00:00:00")))
+             )
+             .select("CUSTOMER_ID", F.col("TX_AMOUNT").cast("double").alias("TX_AMOUNT_D"))
+)
+
+# approx median & IQR using percentiles
+cust_amt = (hist_cust.groupBy("CUSTOMER_ID")
+            .agg(
+              F.expr("percentile_approx(TX_AMOUNT_D, 0.5, 1000)").alias("cust_amt_med_30d"),
+              (F.expr("percentile_approx(TX_AMOUNT_D, 0.75, 1000)") -
+               F.expr("percentile_approx(TX_AMOUNT_D, 0.25, 1000)")).alias("cust_amt_iqr_30d")
+            ))
+
+global_avg = tx.agg(F.avg("TX_AMOUNT_D")).first()[0]
+tx = tx.join(cust_amt, on="CUSTOMER_ID", how="left")\
+       .fillna({"cust_amt_med_30d": global_avg})
+
+tx = tx.withColumn("amt_vs_med",
+                   F.when(F.col("cust_amt_med_30d")>0, F.col("TX_AMOUNT_D")/F.col("cust_amt_med_30d")).otherwise(F.lit(1.0)))
+
+# ---------- select final feature set ----------
+features = (tx.select(
+    "TRANSACTION_ID","CUSTOMER_ID","TERMINAL_ID","event_time",
+    "TX_FRAUD","TX_AMOUNT_D","distance_km","hour_of_day","day_of_week","is_weekend",
+    "cust_txn_2m","cust_txn_5m",
+    "term_fraud_rate_7d","term_txn_7d",
+    "cust_amt_med_30d","cust_amt_iqr_30d","amt_vs_med",
+    "yyyy","mm","dd"
+))
+
+# ---------- write/replace this partition (idempotent) ----------
+(features.write
+   .format("delta")
+   .mode("overwrite")
+   .option("replaceWhere", f"yyyy = '{yyyy}' AND mm = '{mm}' AND dd = '{dd}'")
+   .save(gold_features_path))
+
+print(f"Wrote gold features for {yyyymmdd}")
+
+
+
+gold_features_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/features_daily"
+df = spark.read.format("delta").load(gold_features_path)
+df.display()
+
+
+from pyspark.sql import functions as F
+g = (spark.read.format("delta")
+     .load("abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions")
+     .where((F.col("yyyy")==2025)&(F.col("mm")==1)&(F.col("dd")==1)))
+
+g.agg(F.sum("TX_FRAUD").alias("fraud_tx"), F.count("*").alias("rows")).show()
+
+
+from pyspark.sql import functions as F
+f = (spark.read.format("delta")
+     .load("abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/features_daily")
+     .where((F.col("yyyy")==2025)&(F.col("mm")==1)&(F.col("dd")==1)))
+
+f.agg(
+  F.sum((F.col("cust_txn_2m")>0).cast("int")).alias("nz_2m"),
+  F.sum((F.col("cust_txn_5m")>0).cast("int")).alias("nz_5m")
+).show()
+
+
+from pyspark.sql import functions as F
+
+g = (spark.read.format("delta")
+     .load("abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/features_daily")
+     .where((F.col("yyyy")==2025)&(F.col("mm")==1)&(F.col("dd")==1)))
+
+# See the 2m/5m spikes and whether they’re fraud
+g.select("TRANSACTION_ID","CUSTOMER_ID","event_time","TX_FRAUD","cust_txn_2m","cust_txn_5m")\
+ .where((F.col("cust_txn_2m")>0) | (F.col("cust_txn_5m")>0))\
+ .orderBy("CUSTOMER_ID","event_time")\
+ .show(50, truncate=False)
+
+
+g.select("TRANSACTION_ID","CUSTOMER_ID","event_time","TX_AMOUNT_D","distance_km",
+         "cust_txn_2m","cust_txn_5m","term_txn_7d","term_fraud_rate_7d","TX_FRAUD")\
+ .where("TX_FRAUD = 1")\
+ .orderBy("CUSTOMER_ID","event_time")\
+ .show(truncate=False)
+
+
+from pyspark.sql import functions as F
+
+silver_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+gold_features_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/features_daily"
+
+# Distinct day partitions present in Silver
+silver_days = (spark.read.format("delta").load(silver_path)
+               .select("yyyy","mm","dd").distinct())
+
+# Days already materialized in Gold (tolerates empty/non-existent)
+try:
+    gold_days = (spark.read.format("delta").load(gold_features_path)
+                 .select("yyyy","mm","dd").distinct())
+except Exception:
+    gold_days = spark.createDataFrame([], "yyyy string, mm string, dd string")
+
+missing = (silver_days.alias("s")
+           .join(gold_days.alias("g"), on=["yyyy","mm","dd"], how="left_anti")
+           .orderBy("yyyy","mm","dd"))
+
+missing.show(50, False)
+
+from pyspark.sql import functions as F, Window
+
+def build_gold_for_day(yyyymmdd: str):
+    yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+    silver_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+    gold_features_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/features_daily"
+
+    tx = (spark.read.format("delta").load(silver_path)
+          .where((F.col("yyyy")==yyyy) & (F.col("mm")==mm) & (F.col("dd")==dd)))
+
+    if tx.limit(1).count() == 0:
+        print(f"[SKIP] No silver rows for {yyyymmdd}")
+        return
+
+
+    tx = (
+        tx.withColumn("event_time", F.col("event_time"))
+        .withColumn("TX_AMOUNT_D", F.col("TX_AMOUNT").cast("double"))
+    )
+
+    # ---------- velocity features (customer) ----------
+    tx = tx.withColumn("_ts", F.col("event_time").cast("timestamp").cast("long"))
+
+    w2m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-120, -1)
+    w5m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-300, -1)
+
+    tx = (
+        tx.withColumn("cust_txn_2m", F.count("*").over(w2m))
+        .withColumn("cust_txn_5m", F.count("*").over(w5m))
+    )
+
+    # ---------- terminal risk over rolling 7 days ----------
+    from datetime import datetime, timedelta
+
+    day_dt = datetime.strptime(yyyymmdd, "%Y%m%d")
+    silver_root = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+
+    hist = (
+        spark.read.format("delta").load(silver_root)
+        .where(
+            (F.col("TX_DATETIME") >= F.to_timestamp(F.lit((day_dt - timedelta(days=8)).strftime("%Y-%m-%d") + " 00:00:00")))
+            & (F.col("TX_DATETIME") < F.to_timestamp(F.lit((day_dt + timedelta(days=1)).strftime("%Y-%m-%d") + " 00:00:00")))
+        )
+        .select("TERMINAL_ID", "TX_FRAUD", "TX_DATETIME")
+        .withColumn("event_time", F.col("TX_DATETIME"))
+    )
+
+    term_day = (
+        hist.withColumn("day", F.to_date("event_time"))
+        .groupBy("TERMINAL_ID", "day")
+        .agg(
+            F.mean("TX_FRAUD").alias("term_fraud_rate_day"),
+            F.count("*").alias("term_txn_day"),
+        )
+    )
+
+    end_day = F.to_date(F.lit(day_dt.strftime("%Y-%m-%d")))
+    start_day = F.date_sub(end_day, 7)
+
+    term_7d = (
+        term_day.where((F.col("day") >= start_day) & (F.col("day") < end_day))
+        .groupBy("TERMINAL_ID")
+        .agg(
+            F.mean("term_fraud_rate_day").alias("term_fraud_rate_7d"),
+            F.sum("term_txn_day").alias("term_txn_7d"),
+        )
+    )
+
+    tx = (
+        tx.join(term_7d, on="TERMINAL_ID", how="left")
+        .fillna({"term_fraud_rate_7d": 0.0, "term_txn_7d": 0})
+    )
+
+    # ---------- customer amount stats (30-day) ----------
+    hist_cust = (
+        spark.read.format("delta").load(silver_root)
+        .where(
+            (F.col("TX_DATETIME") >= F.to_timestamp(F.lit((day_dt - timedelta(days=31)).strftime("%Y-%m-%d") + " 00:00:00")))
+            & (F.col("TX_DATETIME") < F.to_timestamp(F.lit(day_dt.strftime("%Y-%m-%d") + " 00:00:00")))
+        )
+        .select("CUSTOMER_ID", F.col("TX_AMOUNT").cast("double").alias("TX_AMOUNT_D"))
+    )
+
+    cust_amt = (
+        hist_cust.groupBy("CUSTOMER_ID")
+        .agg(
+            F.expr("percentile_approx(TX_AMOUNT_D, 0.5, 1000)").alias("cust_amt_med_30d"),
+            (
+                F.expr("percentile_approx(TX_AMOUNT_D, 0.75, 1000)")
+                - F.expr("percentile_approx(TX_AMOUNT_D, 0.25, 1000)")
+            ).alias("cust_amt_iqr_30d"),
+        )
+    )
+
+    global_avg = tx.agg(F.avg("TX_AMOUNT_D")).first()[0]
+    tx = (
+        tx.join(cust_amt, on="CUSTOMER_ID", how="left")
+        .fillna({"cust_amt_med_30d": global_avg})
+    )
+
+    tx = tx.withColumn(
+        "amt_vs_med",
+        F.when(F.col("cust_amt_med_30d") > 0, F.col("TX_AMOUNT_D") / F.col("cust_amt_med_30d")).otherwise(F.lit(1.0)),
+    )
+
+    features = tx.select(
+        "TRANSACTION_ID",
+        "CUSTOMER_ID",
+        "TERMINAL_ID",
+        "event_time",
+        "TX_FRAUD",
+        "TX_AMOUNT_D",
+        "distance_km",
+        "hour_of_day",
+        "day_of_week",
+        "is_weekend",
+        "cust_txn_2m",
+        "cust_txn_5m",
+        "term_fraud_rate_7d",
+        "term_txn_7d",
+        "cust_amt_med_30d",
+        "cust_amt_iqr_30d",
+        "amt_vs_med",
+        "yyyy",
+        "mm",
+        "dd",
+    )
+
+    (
+        features.write
+        .format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", f"yyyy = '{yyyy}' AND mm = '{mm}' AND dd = '{dd}'")
+        .save(gold_features_path)
+    )
+
+    print(f"Wrote gold features for {yyyymmdd}")
+	
+from pyspark.sql import functions as F
+
+ymd_df = (missing
+    .select(
+        F.col("yyyy").cast("string").alias("yyyy"),
+        F.lpad(F.col("mm").cast("string"), 2, "0").alias("mm"),
+        F.lpad(F.col("dd").cast("string"), 2, "0").alias("dd"),
+    )
+    .distinct()
+    .orderBy("yyyy","mm","dd")
+    .withColumn("ymd", F.concat("yyyy","mm","dd"))
+    .select("ymd")
+)
+
+ymd_list = [r["ymd"] for r in ymd_df.collect()]
+print(ymd_list[:10])  # sanity: should look like ['20250101','20250102',...]
+
+

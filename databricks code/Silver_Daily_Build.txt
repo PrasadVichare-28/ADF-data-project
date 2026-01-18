@@ -1,0 +1,308 @@
+# ---- 0a: create widgets and stop so you can fill them in ----
+dbutils.widgets.text("adls_auth_type", "sas")   # "sas" or "account_key"
+dbutils.widgets.text("adls_secret", "")         # paste SAS (no leading '?') or account key
+dbutils.widgets.text("yyyymmdd", "")            # blank = yesterday (America/Chicago)
+
+print("Widgets created. Fill them above (or in the right Widgets panel), then run the next cell.")
+dbutils.notebook.exit("STOP_AFTER_WIDGETS")     # safely stop here on the first run
+
+
+from pyspark.sql import functions as F, types as T, Window
+from datetime import datetime, timedelta
+import pytz
+
+# Read widget values
+auth_type   = dbutils.widgets.get("adls_auth_type").strip().lower()
+adls_secret = dbutils.widgets.get("adls_secret").strip().lstrip("?")  # remove leading '?' for SAS
+yyyymmdd    = dbutils.widgets.get("yyyymmdd").strip()
+
+# Partition default: yesterday (America/Chicago)
+if not yyyymmdd:
+    tz = pytz.timezone("America/Chicago")
+    y  = datetime.now(tz) - timedelta(days=1)
+    yyyymmdd = y.strftime("%Y%m%d")
+yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+print(f"[Silver] Running for {yyyy}-{mm}-{dd}")
+
+# Storage paths
+account   = "azmlstoragedatalake"
+container = "raw"
+bronze_root = f"abfss://{container}@{account}.dfs.core.windows.net/bronze/transactions"
+silver_path = f"abfss://{container}@{account}.dfs.core.windows.net/silver/transactions"
+
+# Auth (validate now, after you had a chance to fill widgets)
+if not adls_secret:
+    raise Exception("Missing ADLS secret. Set the 'adls_secret' widget (SAS without leading '?' or account key).")
+
+if auth_type == "sas":
+    spark.conf.set("fs.azure.sas.token.provider.type", "org.apache.hadoop.fs.azurebfs.sas.FixedSASTokenProvider")
+    spark.conf.set(f"fs.azure.sas.fixed.token.{account}.dfs.core.windows.net", adls_secret)
+    print("[Auth] Using SAS from widget.")
+elif auth_type == "account_key":
+    spark.conf.set(f"fs.azure.account.key.{account}.dfs.core.windows.net", adls_secret)
+    print("[Auth] Using account key from widget.")
+else:
+    raise ValueError("adls_auth_type must be 'sas' or 'account_key'")
+
+
+
+def _hav(lat1, lon1, lat2, lon2):
+    import math
+    if None in (lat1, lon1, lat2, lon2): 
+        return None
+    R = 6371.0
+    phi1, phi2 = map(math.radians, [lat1, lat2])
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlmb/2)**2
+    return 2*R*math.asin(math.sqrt(a))
+
+hav = F.udf(_hav, T.DoubleType())
+
+# Read all bronze (CSV) and filter by partitions; Spark discovers yyyy/mm/dd columns
+bz = (spark.read
+      .option("header", True)
+      .csv(bronze_root))
+
+# Normalize partition cols to string & zero-pad to avoid mismatches
+bz = (bz
+      .withColumn("yyyy", F.col("yyyy").cast("string"))
+      .withColumn("mm",   F.lpad(F.col("mm").cast("string"), 2, "0"))
+      .withColumn("dd",   F.lpad(F.col("dd").cast("string"), 2, "0")))
+
+bz_day = bz.where((F.col("yyyy")==yyyy) & (F.col("mm")==mm) & (F.col("dd")==dd))
+
+# Guard: fail if bronze day not present (stops the pipeline early)
+if bz_day.limit(1).count() == 0:
+    raise Exception(f"[Silver] No Bronze rows for {yyyymmdd}. Upstream copy likely failed.")
+
+
+# Base casts & standardization
+df = (bz_day
+  .withColumn("TRANSACTION_ID", F.upper(F.trim("TRANSACTION_ID")).cast(T.StringType()))
+  .withColumn("TX_DATETIME",    F.to_timestamp("TX_DATETIME"))
+  .withColumn("TX_TIME_SECONDS",F.col("TX_TIME_SECONDS").cast(T.IntegerType()))
+  .withColumn("TX_TIME_DAYS",   F.col("TX_TIME_DAYS").cast(T.IntegerType()))
+  .withColumn("CUSTOMER_ID",    F.upper(F.trim("CUSTOMER_ID")).cast(T.StringType()))
+  .withColumn("TERMINAL_ID",    F.upper(F.trim("TERMINAL_ID")).cast(T.StringType()))
+  .withColumn("TX_AMOUNT",      F.round(F.col("TX_AMOUNT").cast(T.DecimalType(12,2)), 2))
+  .withColumn("TX_FRAUD",       F.col("TX_FRAUD").cast(T.IntegerType()))
+  .withColumn("TX_FRAUD_SCENARIO", F.col("TX_FRAUD_SCENARIO").cast(T.StringType()))
+  .withColumn("CUSTOMER_LAT",   F.col("CUSTOMER_LAT").cast(T.DoubleType()))
+  .withColumn("CUSTOMER_LON",   F.col("CUSTOMER_LON").cast(T.DoubleType()))
+  .withColumn("TERMINAL_LAT",   F.col("TERMINAL_LAT").cast(T.DoubleType()))
+  .withColumn("TERMINAL_LON",   F.col("TERMINAL_LON").cast(T.DoubleType()))
+)
+
+# Derived columns
+df = (df
+  .withColumn("event_time",  F.col("TX_DATETIME"))
+  .withColumn("distance_km", hav("CUSTOMER_LAT","CUSTOMER_LON","TERMINAL_LAT","TERMINAL_LON"))
+  .withColumn("hour_of_day", F.hour("event_time"))
+  .withColumn("day_of_week", F.dayofweek("event_time"))        # 1=Sunday … 7=Saturday
+  .withColumn("is_weekend",  ((F.col("day_of_week")==1) | (F.col("day_of_week")==7)).cast("boolean"))
+)
+
+# De-duplicate by TRANSACTION_ID (keep latest event_time if dups)
+w = Window.partitionBy("TRANSACTION_ID").orderBy(F.col("event_time").desc_nulls_last())
+df = df.withColumn("_rn", F.row_number().over(w)).where("_rn = 1").drop("_rn")
+
+# Ensure partition columns are string and zero-padded (consistency with Bronze)
+df = (df
+  .withColumn("yyyy", F.col("yyyy").cast("string"))
+  .withColumn("mm",   F.lpad(F.col("mm").cast("string"), 2, "0"))
+  .withColumn("dd",   F.lpad(F.col("dd").cast("string"), 2, "0"))
+)
+
+
+from pyspark.sql.functions import col
+
+# Cast partition columns to INT if needed
+df_fixed = df.withColumn("yyyy", col("yyyy").cast("int")) \
+    .withColumn("mm", col("mm").cast("int")) \
+    .withColumn("dd", col("dd").cast("int"))
+
+(
+    df_fixed.write
+        .format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", f"yyyy = {int(yyyy)} AND mm = {int(mm)} AND dd = {int(dd)}")
+        .partitionBy("yyyy", "mm", "dd")
+        .save(silver_path)
+)
+print(f"[Silver] Wrote partition yyyy={yyyy}/mm={mm}/dd={dd}")
+
+sdf = (spark.read.format("delta").load(silver_path)
+       .where((F.col("yyyy")==yyyy) & (F.col("mm")==mm) & (F.col("dd")==dd)))
+
+viol = (sdf.select(
+          F.sum(F.when(F.col("TRANSACTION_ID").isNull(), 1).otherwise(0)).alias("null_pk"),
+          F.sum(F.when((F.col("TX_TIME_SECONDS") < 0) | (F.col("TX_TIME_SECONDS") > 86399), 1).otherwise(0)).alias("bad_time"),
+          F.sum(F.when((F.col("TX_AMOUNT") <= 0) | (F.col("TX_AMOUNT") > 8000), 1).otherwise(0)).alias("bad_amount"),
+          F.sum(F.when(F.col("CUSTOMER_LAT").isNull() | F.col("TERMINAL_LAT").isNull(), 1).otherwise(0)).alias("null_geo")
+        ).collect()[0].asDict())
+
+checks = {
+  "non_null_pk": viol["null_pk"]  == 0,
+  "time_range":  viol["bad_time"] == 0,
+  "amount_range":viol["bad_amount"] == 0,
+  "latlon_nulls":viol["null_geo"] == 0
+}
+print("[Silver][DQ]", checks)
+
+if not all(checks.values()):
+    raise Exception(f"[Silver][DQ] failed for {yyyymmdd}: {checks}")
+else:
+    total = sdf.count()
+    print(f"[Silver][DQ] passed for {yyyymmdd} with {total} rows")
+
+
+# ---- Section 6: Type-1 light dims (path-based Delta MERGE, no table registration) ----
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+# Reuse your day param (ensure it's set earlier in the notebook)
+# dbutils.widgets.text("yyyymmdd", "20250101")
+yyyymmdd = dbutils.widgets.get("yyyymmdd").strip()
+yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+
+# Paths (reuse your variables from the notebook header)
+account   = "azmlstoragedatalake"
+container = "raw"
+silver_path    = f"abfss://{container}@{account}.dfs.core.windows.net/silver/transactions"
+cust_dim_path  = f"abfss://{container}@{account}.dfs.core.windows.net/silver/dim_customers"
+term_dim_path  = f"abfss://{container}@{account}.dfs.core.windows.net/silver/dim_terminals"
+
+# 1) Read ONE DAY from Silver by path (no spark.table())
+tx_day = (spark.read.format("delta").load(silver_path)
+          .where((F.col("yyyy")==yyyy) & (F.col("mm")==mm) & (F.col("dd")==dd)))
+
+if tx_day.limit(1).count() == 0:
+    raise Exception(f"[Dim] No Silver rows for {yyyymmdd} — run Section 1–4 first for this date.")
+
+# 2) Build today’s customer/terminal increments
+cust_incr = (tx_day.groupBy("CUSTOMER_ID")
+  .agg(
+    F.first("CUSTOMER_LAT", True).alias("CUSTOMER_LAT"),
+    F.first("CUSTOMER_LON", True).alias("CUSTOMER_LON"),
+    F.min("event_time").alias("first_seen_ts_incr"),
+    F.max("event_time").alias("last_seen_ts_incr"),
+  ))
+
+term_incr = (tx_day.groupBy("TERMINAL_ID")
+  .agg(
+    F.first("TERMINAL_LAT", True).alias("TERMINAL_LAT"),
+    F.first("TERMINAL_LON", True).alias("TERMINAL_LON"),
+    F.min("event_time").alias("first_seen_ts_incr"),
+    F.max("event_time").alias("last_seen_ts_incr"),
+  ))
+
+# 3) Ensure empty Delta tables exist at the dim paths (bootstrap-once if missing)
+def ensure_delta_exists(path: str, template_df):
+    try:
+        spark.read.format("delta").load(path).limit(1).count()
+        return
+    except Exception:
+        (template_df.limit(0)  # write empty schema
+           .write.format("delta").mode("overwrite").save(path))
+
+cust_template = cust_incr.select(
+    F.col("CUSTOMER_ID"),
+    F.col("CUSTOMER_LAT"),
+    F.col("CUSTOMER_LON"),
+    F.col("first_seen_ts_incr").alias("first_seen_ts"),
+    F.col("last_seen_ts_incr").alias("last_seen_ts")
+)
+term_template = term_incr.select(
+    F.col("TERMINAL_ID"),
+    F.col("TERMINAL_LAT"),
+    F.col("TERMINAL_LON"),
+    F.col("first_seen_ts_incr").alias("first_seen_ts"),
+    F.col("last_seen_ts_incr").alias("last_seen_ts")
+)
+
+ensure_delta_exists(cust_dim_path, cust_template)
+ensure_delta_exists(term_dim_path, term_template)
+
+# 4) MERGE (Type-1 upsert) — Customers
+cust_tbl = DeltaTable.forPath(spark, cust_dim_path)
+cust_tbl.alias("T").merge(
+    cust_incr.alias("S"),
+    "T.CUSTOMER_ID = S.CUSTOMER_ID"
+).whenMatchedUpdate(set={
+    "CUSTOMER_LAT":  "COALESCE(S.CUSTOMER_LAT, T.CUSTOMER_LAT)",
+    "CUSTOMER_LON":  "COALESCE(S.CUSTOMER_LON, T.CUSTOMER_LON)",
+    "first_seen_ts": "LEAST(T.first_seen_ts, S.first_seen_ts_incr)",
+    "last_seen_ts":  "GREATEST(T.last_seen_ts, S.last_seen_ts_incr)"
+}).whenNotMatchedInsert(values={
+    "CUSTOMER_ID":   "S.CUSTOMER_ID",
+    "CUSTOMER_LAT":  "S.CUSTOMER_LAT",
+    "CUSTOMER_LON":  "S.CUSTOMER_LON",
+    "first_seen_ts": "S.first_seen_ts_incr",
+    "last_seen_ts":  "S.last_seen_ts_incr"
+}).execute()
+
+# 5) MERGE (Type-1 upsert) — Terminals
+term_tbl = DeltaTable.forPath(spark, term_dim_path)
+term_tbl.alias("T").merge(
+    term_incr.alias("S"),
+    "T.TERMINAL_ID = S.TERMINAL_ID"
+).whenMatchedUpdate(set={
+    "TERMINAL_LAT":  "COALESCE(S.TERMINAL_LAT, T.TERMINAL_LAT)",
+    "TERMINAL_LON":  "COALESCE(S.TERMINAL_LON, T.TERMINAL_LON)",
+    "first_seen_ts": "LEAST(T.first_seen_ts, S.first_seen_ts_incr)",
+    "last_seen_ts":  "GREATEST(T.last_seen_ts, S.last_seen_ts_incr)"
+}).whenNotMatchedInsert(values={
+    "TERMINAL_ID":   "S.TERMINAL_ID",
+    "TERMINAL_LAT":  "S.TERMINAL_LAT",
+    "TERMINAL_LON":  "S.TERMINAL_LON",
+    "first_seen_ts": "S.first_seen_ts_incr",
+    "last_seen_ts":  "S.last_seen_ts_incr"
+}).execute()
+
+print(f"[Dim] Upserted: customers & terminals for {yyyymmdd}")
+
+
+silver_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+import pyspark.sql.functions as F
+before = (spark.read.format("delta").load(silver_path)
+          .where("yyyy='2025' and mm='01' and dd='01'")).count()
+print("Before:", before)
+# run the new notebook cell
+after = (spark.read.format("delta").load(silver_path)
+         .where("yyyy='2025' and mm='01' and dd='01'")).count()
+print("After:", after)
+
+
+# Discover which Bronze days don't exist in Silver, then loop sequentially
+bronze_days = (spark.read.option("header", True).csv(bronze_root)
+               .select(
+                 F.col("yyyy").cast("string").alias("yyyy"),
+                 F.lpad(F.col("mm").cast("string"), 2, "0").alias("mm"),
+                 F.lpad(F.col("dd").cast("string"), 2, "0").alias("dd"),
+               ).distinct())
+
+try:
+    silver_days = (spark.read.format("delta").load(silver_path)
+                   .select("yyyy","mm","dd").distinct())
+except Exception:
+    silver_days = spark.createDataFrame([], "yyyy string, mm string, dd string")
+
+missing = (bronze_days.alias("b")
+           .join(silver_days.alias("s"), on=["yyyy","mm","dd"], how="left_anti")
+           .orderBy("yyyy","mm","dd"))
+
+todo = [f"{r['yyyy']}{r['mm']}{r['dd']}" for r in missing.collect()]
+print(f"[Backfill] Will process: {todo}")
+
+# Sequentially call this SAME notebook for each date (idempotent)
+for ymd in todo:
+    print(f"[Backfill] Running {ymd} …")
+    dbutils.notebook.run(
+        dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get(),
+        timeout_seconds=0,
+        arguments={"yyyymmdd": ymd, "adls_auth_type": auth_type, "adls_secret": adls_secret}
+    )
+print("[Backfill] Done.")
+
+

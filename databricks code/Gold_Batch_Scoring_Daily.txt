@@ -1,0 +1,236 @@
+# ----- widgets -----
+dbutils.widgets.text("adls_auth_type", "sas")   # "sas" or "account_key"
+dbutils.widgets.text("adls_secret", "")         # SAS (no leading '?') or account key
+dbutils.widgets.text("yyyymmdd", "")            # leave blank => defaults to yesterday (America/Chicago)
+
+from datetime import datetime, timedelta
+import pytz
+
+auth_type   = dbutils.widgets.get("adls_auth_type").strip().lower()
+adls_secret = dbutils.widgets.get("adls_secret").strip().lstrip("?")
+yyyymmdd    = dbutils.widgets.get("yyyymmdd").strip()
+
+
+if not yyyymmdd:
+    tz = pytz.timezone("America/Chicago")
+    y  = datetime.now(tz) - timedelta(days=1)
+    yyyymmdd = y.strftime("%Y%m%d")
+
+yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+
+if not adls_secret:
+    raise Exception("Missing ADLS secret.")
+
+# ----- paths -----
+account   = "azmlstoragedatalake"
+container = "raw"
+gold_path    = f"abfss://{container}@{account}.dfs.core.windows.net/gold/features_daily"
+scores_path  = f"abfss://{container}@{account}.dfs.core.windows.net/gold/scores_daily"
+alerts_path  = f"abfss://{container}@{account}.dfs.core.windows.net/gold/alerts_daily"
+model_path   = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1"
+meta_path    = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1_meta"
+
+# ----- auth -----
+if auth_type == "sas":
+    spark.conf.set("fs.azure.sas.token.provider.type", "org.apache.hadoop.fs.azurebfs.sas.FixedSASTokenProvider")
+    spark.conf.set(f"fs.azure.sas.fixed.token.{account}.dfs.core.windows.net", adls_secret)
+elif auth_type == "account_key":
+    spark.conf.set(f"fs.azure.account.key.{account}.dfs.core.windows.net", adls_secret)
+else:
+    raise ValueError("adls_auth_type must be 'sas' or 'account_key'")
+
+print(f"[Auth OK] Scoring day {yyyymmdd}")
+
+
+from pyspark.ml.pipeline import PipelineModel
+
+model = PipelineModel.load(model_path)
+meta  = spark.read.format("delta").load(meta_path).limit(1).collect()[0].asDict()
+thr   = float(meta["threshold"])
+features = meta["features"].split(",")
+print("Threshold:", thr)
+print("Features:", features)
+
+
+from pyspark.sql import functions as F, types as T
+from pyspark.ml.functions import vector_to_array
+
+# ---- load one day from Gold ----
+gold_day = (
+    spark.read.format("delta").load(gold_path)
+    .where((F.col("yyyy") == yyyy) & (F.col("mm") == mm) & (F.col("dd") == dd))
+)
+if gold_day.limit(1).count() == 0:
+    raise Exception(f"No Gold rows for {yyyymmdd}")
+
+# ---- normalize schema for features ----
+# Ensure is_weekend exists and is DOUBLE (0.0/1.0) for the model pipeline
+if "is_weekend" not in [f.name for f in gold_day.schema.fields]:
+    gold_day = gold_day.withColumn(
+        "is_weekend", (F.col("day_of_week").isin(6, 7)).cast(T.DoubleType())
+    )
+else:
+    gold_day = gold_day.withColumn("is_weekend", F.col("is_weekend").cast(T.DoubleType()))
+
+# Float-like features → DOUBLE
+float_feats = [
+    "TX_AMOUNT_D","distance_km","is_weekend",
+    "term_fraud_rate_7d","cust_amt_med_30d","cust_amt_iqr_30d","amt_vs_med"
+]
+for c in float_feats:
+    if c in [f.name for f in gold_day.schema.fields]:
+        gold_day = gold_day.withColumn(c, F.col(c).cast(T.DoubleType()))
+
+# Count/index features → INTEGER
+int_feats = ["hour_of_day","day_of_week","cust_txn_2m","cust_txn_5m","term_txn_7d"]
+for c in int_feats:
+    if c in [f.name for f in gold_day.schema.fields]:
+        gold_day = gold_day.withColumn(c, F.col(c).cast(T.IntegerType()))
+
+# ---- fill NULLs & replace NaNs safely ----
+# Int-like: fill NULLs
+gold_day = gold_day.fillna({
+    "hour_of_day": 0,
+    "day_of_week": 1,
+    "cust_txn_2m": 0,
+    "cust_txn_5m": 0,
+    "term_txn_7d": 0
+})
+
+# Doubles: coalesce NULLs then replace NaNs with defaults
+double_defaults = {
+    "TX_AMOUNT_D": 0.0,
+    "distance_km": 0.0,
+    "is_weekend": 0.0,
+    "term_fraud_rate_7d": 0.0,
+    "cust_amt_med_30d": 0.0,
+    "cust_amt_iqr_30d": 0.0,
+    "amt_vs_med": 1.0
+}
+for c, d in double_defaults.items():
+    if c in [f.name for f in gold_day.schema.fields]:
+        gold_day = gold_day.withColumn(c, F.coalesce(F.col(c), F.lit(d)))
+        gold_day = gold_day.withColumn(c, F.when(F.isnan(F.col(c)), F.lit(d)).otherwise(F.col(c)))
+
+# ---- transform & compute probability robustly ----
+scored = (
+    model.transform(gold_day)
+    .withColumn("p_fraud_raw", vector_to_array("probability").getItem(1))
+    .withColumn(
+        "p_fraud",
+        F.when(F.col("p_fraud_raw").isNull() | F.isnan(F.col("p_fraud_raw")), F.lit(0.0))
+         .otherwise(F.col("p_fraud_raw"))
+    )
+    .drop("p_fraud_raw")
+    .withColumn("is_alert", (F.col("p_fraud") >= F.lit(thr)).cast(T.IntegerType()))
+    .select(
+        "TRANSACTION_ID","CUSTOMER_ID","TERMINAL_ID","event_time",
+        "TX_FRAUD", "p_fraud","is_alert",
+        *features, "yyyy","mm","dd"
+    )
+)
+
+# ---- EITHER do Fix A (reset the dataset) ----
+dbutils.fs.rm(scores_path, True)
+dbutils.fs.rm(alerts_path, True)
+
+# ---- OR do Fix B: cast to existing type before writing ----
+
+
+# ---- write scores (idempotent partition overwrite) ----
+(scored.write.format("delta").mode("overwrite")
+    .option("replaceWhere", f"yyyy='{yyyy}' AND mm='{mm}' AND dd='{dd}'")
+    .save(scores_path))
+
+# ---- alerts subset ----
+alerts = scored.where("is_alert = 1").select(
+    "TRANSACTION_ID","CUSTOMER_ID","TERMINAL_ID","event_time","p_fraud","TX_FRAUD","yyyy","mm","dd"
+)
+
+# keep alerts' is_weekend dtype aligned too
+if target_type == "boolean":
+    alerts = alerts.withColumn("is_weekend", F.lit(None).cast("boolean"))  # or drop if not needed
+# (if you also include features in alerts, cast same as 'scored' above)
+
+(alerts.write.format("delta").mode("overwrite")
+    .option("replaceWhere", f"yyyy='{yyyy}' AND mm='{mm}' AND dd='{dd}'")
+    .save(alerts_path))
+
+print(f"[Done] Wrote scores_daily & alerts_daily for {yyyymmdd}")
+
+
+
+s = scored.agg(
+    F.count("*").alias("rows"),
+    F.sum("is_alert").alias("alerts"),
+    F.sum(F.when((F.col("is_alert")==1) & (F.col("TX_FRAUD")==1), 1).otherwise(0)).alias("tp"),
+    F.sum(F.when((F.col("is_alert")==1) & (F.col("TX_FRAUD")==0), 1).otherwise(0)).alias("fp"),
+    F.sum(F.when(F.col("TX_FRAUD")==1, 1).otherwise(0)).alias("pos")
+).collect()[0].asDict()
+prec = (s["tp"]/s["alerts"]) if s["alerts"] else 0.0
+rec  = (s["tp"]/s["pos"]) if s["pos"] else 0.0
+print({"rows":s["rows"], "alerts":s["alerts"], "precision@thr":round(prec,4), "recall@thr":round(rec,4)})
+
+
+# --- A3 — append daily monitoring row ---
+monitor_path = f"abfss://{container}@{account}.dfs.core.windows.net/gold/monitoring_daily"
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# 1) base metrics for the day
+base = scored.agg(
+    F.count("*").alias("rows"),
+    F.avg("p_fraud").alias("avg_score"),
+    F.sum("is_alert").alias("alerts"),
+    F.sum(F.when((F.col("is_alert")==1) & (F.col("TX_FRAUD")==1), 1).otherwise(0)).alias("tp"),
+    F.sum(F.when((F.col("is_alert")==1) & (F.col("TX_FRAUD")==0), 1).otherwise(0)).alias("fp"),
+    F.sum(F.when(F.col("TX_FRAUD")==1, 1).otherwise(0)).alias("pos")
+).withColumn("yyyymmdd", F.lit(yyyymmdd))
+
+# 2) compute precision/recall safely
+base = (base
+    .withColumn("precision_at_thr", F.when(F.col("alerts")>0, F.col("tp")/F.col("alerts")).otherwise(F.lit(0.0)))
+    .withColumn("recall_at_thr",    F.when(F.col("pos")>0,    F.col("tp")/F.col("pos")).otherwise(F.lit(0.0)))
+)
+
+# 3) (optional) score PSI vs previous day using coarse 10 bins
+def psi_expr(col):
+    # build equal-width bins in [0,1]
+    return F.when(F.col(col).isNull(), 0.0).otherwise(F.col(col))
+
+scored_bins = (scored
+   .withColumn("bin", F.floor(F.col("p_fraud")*10))   # 0..9
+   .groupBy("bin").agg(F.count("*").alias("cnt"))
+   .withColumn("p", F.col("cnt")/F.sum("cnt").over(Window.partitionBy()))
+   .select(F.lit(yyyymmdd).alias("yyyymmdd"), "bin", "p"))
+
+# load previous day dist if exists
+from datetime import datetime, timedelta
+prev = (datetime.strptime(yyyymmdd,"%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+try:
+    prev_bins = (spark.read.format("delta").load(monitor_path + "_bins")
+                 .where(F.col("yyyymmdd")==prev)
+                 .select("bin", F.col("p").alias("p_prev")))
+    psi = (scored_bins.join(prev_bins, "bin", "left")
+           .fillna({"p_prev": 1.0/10})
+           .withColumn("term", (F.col("p")-F.col("p_prev"))*F.log(F.col("p")/F.col("p_prev")))
+           .agg(F.sum("term").alias("psi")).first()["psi"])
+except Exception:
+    psi = None
+
+# write monitoring row
+mon_row = base.withColumn("psi_vs_prev", F.lit(float(psi) if psi is not None else None))
+(mon_row
+ .write.format("delta").mode("append")
+ .save(monitor_path))
+
+# also persist bins for tomorrow's PSI
+(scored_bins
+ .write.format("delta").mode("append")
+ .save(monitor_path + "_bins"))
+
+print("[Monitoring] wrote daily row and bins.")
+
+
+

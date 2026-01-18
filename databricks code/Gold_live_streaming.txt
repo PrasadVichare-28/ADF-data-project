@@ -1,0 +1,479 @@
+dbutils.widgets.text("adls_auth_type", "sas")     # sas | account_key
+dbutils.widgets.text("adls_secret", "")           # SAS token (no leading '?') or account key
+dbutils.widgets.text("eh_namespace", "")          # e.g. kafka-event
+dbutils.widgets.text("eh_conn", "")               # Event Hubs connection string (use secret)
+dbutils.widgets.text("in_hub", "transactions_raw")
+dbutils.widgets.text("out_hub", "fraud_alerts")   # optional
+
+auth_type   = dbutils.widgets.get("adls_auth_type")
+secret      = dbutils.widgets.get("adls_secret")
+eh_namespace= dbutils.widgets.get("eh_namespace")
+eh_conn     = dbutils.widgets.get("eh_conn")
+IN_HUB      = dbutils.widgets.get("in_hub")
+OUT_HUB     = dbutils.widgets.get("out_hub")
+
+
+account   = "azmlstoragedatalake"
+container = "raw"
+
+# === ADLS auth ===
+if auth_type == "sas":
+    spark.conf.set(f"fs.azure.sas.token.provider.type.{account}.dfs.core.windows.net",
+                   "org.apache.hadoop.fs.azurebfs.sas.FixedSASTokenProvider")
+    spark.conf.set(f"fs.azure.sas.fixed.token.{account}.dfs.core.windows.net", secret)
+elif auth_type == "account_key":
+    spark.conf.set(f"fs.azure.account.key.{account}.dfs.core.windows.net", secret)
+else:
+    raise Exception("Unsupported adls_auth_type")
+
+spark.conf.set("spark.sql.shuffle.partitions", "64")
+
+from pyspark.sql import functions as F, types as T
+from pyspark.ml.pipeline import PipelineModel
+ACCOUNT   = "azmlstoragedatalake"
+CONTAINER = "raw"
+# Storage paths
+bronze_root        = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/bronze/transactions"  # (not used here)
+lookup_cust_path   = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/lookup_cust_amount_stats"
+lookup_term_path   = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/lookup_term_7d"
+model_path         = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/models/fraud_trad_v1"
+meta_path          = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/models/fraud_trad_v1_meta"
+scores_stream_path = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/stream_scores"
+alerts_stream_path = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/stream_alerts"
+checkpoint_dir     = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/_chk/stream_scoring_live_v2"
+
+
+meta   = spark.read.format("delta").load(meta_path).limit(1).collect()[0].asDict()
+thr    = float(meta["threshold"])
+features = meta["features"].split(",")
+
+model  = PipelineModel.load(model_path)
+
+cust_all = spark.read.format("delta").load(lookup_cust_path)
+term_all = spark.read.format("delta").load(lookup_term_path)
+cust_snap = (cust_all.where(F.col("as_of_date")==cust_all.agg(F.max("as_of_date")).first()[0])
+             .select("CUSTOMER_ID","cust_amt_med_30d","cust_amt_iqr_30d"))
+term_snap = (term_all.where(F.col("as_of_date")==term_all.agg(F.max("as_of_date")).first()[0])
+             .select("TERMINAL_ID","term_fraud_rate_7d","term_txn_7d"))
+
+
+kafka_read_opts = {
+  "kafka.bootstrap.servers": f"{eh_namespace}.servicebus.windows.net:9093",
+  "kafka.security.protocol": "SASL_SSL",
+  "kafka.sasl.mechanism": "PLAIN",
+  "kafka.sasl.jaas.config": f'kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required username="$ConnectionString" password="{eh_conn}";',
+  "subscribe": IN_HUB,
+  "startingOffsets": "latest",       # use "earliest" only when you want to replay
+  "failOnDataLoss": "false"
+}
+
+schema = T.StructType([
+    T.StructField("TRANSACTION_ID", T.StringType()),
+    T.StructField("TX_DATETIME",    T.StringType()),
+    T.StructField("TX_TIME_SECONDS",T.IntegerType()),
+    T.StructField("TX_TIME_DAYS",   T.IntegerType()),
+    T.StructField("CUSTOMER_ID",    T.StringType()),
+    T.StructField("TERMINAL_ID",    T.StringType()),
+    T.StructField("TX_AMOUNT",      T.DoubleType()),
+    T.StructField("TX_FRAUD",       T.IntegerType()),
+    T.StructField("TX_FRAUD_SCENARIO", T.StringType()),
+    T.StructField("CUSTOMER_LAT",   T.DoubleType()),
+    T.StructField("CUSTOMER_LON",   T.DoubleType()),
+    T.StructField("TERMINAL_LAT",   T.DoubleType()),
+    T.StructField("TERMINAL_LON",   T.DoubleType()),
+])
+
+raw_kafka = (spark.readStream.format("kafka").options(**kafka_read_opts).load())
+events = (raw_kafka
+  .select(F.col("value").cast("string").alias("v"))
+  .select(F.from_json("v", schema).alias("j"))
+  .select("j.*")
+  .withColumn("event_time", F.to_timestamp("TX_DATETIME"))
+)
+
+
+import math
+from pyspark.sql import Window
+from pyspark.ml.functions import vector_to_array
+
+@F.udf("double")
+def haversine_km(lat1, lon1, lat2, lon2):
+    try:
+        R=6371.0
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2-lat1); dl = math.radians(lon2-lon1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+        return 2*R*math.asin(math.sqrt(a))
+    except Exception:
+        return None
+
+def score_batch(batch_df, batch_id):
+    if batch_df.rdd.isEmpty():
+        return
+
+    df = (batch_df
+          .withColumn("hour_of_day", F.hour("event_time"))
+          .withColumn("_dow_sun1", F.dayofweek("event_time"))
+          .withColumn("day_of_week", (((F.col("_dow_sun1")+5)%7)+1)).drop("_dow_sun1")
+          .withColumn("is_weekend", F.when(F.col("day_of_week").isin(6,7), 1.0).otherwise(0.0))
+          .withColumn("TX_AMOUNT_D", F.col("TX_AMOUNT").cast("double"))
+          .withColumn("distance_km", haversine_km("CUSTOMER_LAT","CUSTOMER_LON","TERMINAL_LAT","TERMINAL_LON"))
+         )
+
+    # lightweight velocity features (micro-batch approximation)
+    df = df.withColumn("_ts", F.col("event_time").cast("long"))
+    w2m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-120, -1)
+    w5m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-300, -1)
+    df = (df.withColumn("cust_txn_2m", F.count("*").over(w2m))
+            .withColumn("cust_txn_5m", F.count("*").over(w5m)))
+
+    # join daily lookups as broadcast
+    df = (df.join(F.broadcast(cust_snap), on="CUSTOMER_ID", how="left")
+            .join(F.broadcast(term_snap), on="TERMINAL_ID",  how="left"))
+
+    # hygiene
+    doubles = ["TX_AMOUNT_D","distance_km","is_weekend","cust_amt_med_30d","cust_amt_iqr_30d","term_fraud_rate_7d"]
+    for c in doubles:
+        if c in df.columns:
+            df = df.withColumn(c, F.coalesce(F.col(c).cast("double"), F.lit(0.0)))
+            df = df.withColumn(c, F.when(F.isnan(F.col(c)), F.lit(0.0)).otherwise(F.col(c)))
+    ints = ["hour_of_day","day_of_week","cust_txn_2m","cust_txn_5m","term_txn_7d"]
+    for c in ints:
+        if c in df.columns:
+            df = df.withColumn(c, F.coalesce(F.col(c).cast("int"), F.lit(0)))
+
+    df = df.withColumn("amt_vs_med",
+            F.when(F.col("cust_amt_med_30d")>0, F.col("TX_AMOUNT_D")/F.col("cust_amt_med_30d")).otherwise(F.lit(1.0)))
+
+    scored = (model.transform(df)
+              .withColumn("p_fraud", F.coalesce(vector_to_array("probability").getItem(1), F.lit(0.0)))
+              .withColumn("is_alert", (F.col("p_fraud") >= F.lit(thr)).cast("int")))
+
+    base_cols = ["TRANSACTION_ID","CUSTOMER_ID","TERMINAL_ID","event_time","TX_AMOUNT_D","p_fraud","is_alert","TX_FRAUD"]
+    out = (scored.withColumn("proc_date", F.to_date("event_time")))
+
+    # drop duplicate feature names against base_cols + proc_date
+    already = set([c.lower() for c in base_cols+["proc_date"]])
+    feat = [c for c in features if c.lower() not in already]
+
+    out = out.select(*(base_cols + feat + ["proc_date"]))
+
+    out.write.format("delta").mode("append").save(scores_stream_path)
+    out.where("is_alert=1") \
+       .select("TRANSACTION_ID","CUSTOMER_ID","TERMINAL_ID","event_time","TX_AMOUNT_D","p_fraud","proc_date") \
+       .write.format("delta").mode("append").save(alerts_stream_path)
+
+
+
+query = (events.writeStream
+         .foreachBatch(score_batch)
+         .option("checkpointLocation", checkpoint_dir)
+         .trigger(processingTime="15 seconds")
+         .start())
+
+print("Live scoring stream started.")
+
+
+from pyspark.sql import functions as F
+
+scores = spark.read.format("delta").load(scores_stream_path)
+alerts = spark.read.format("delta").load(alerts_stream_path)
+
+print("scores:", scores.count(), "| alerts:", alerts.count())
+(scores.groupBy("proc_date").count().orderBy("proc_date").show(50, False))
+(alerts.groupBy("proc_date").count().orderBy("proc_date").show(50, False))
+
+
+from pyspark.sql import functions as F
+
+scores_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/stream_scores"
+S = spark.read.format("delta").load(scores_path)
+
+# Helpers
+def safe_div(n, d):
+    return F.when(d != 0, n / d)
+
+y    = F.coalesce(F.col("TX_FRAUD").cast("int"),  F.lit(0))     # label 0/1
+yhat = F.coalesce(F.col("is_alert").cast("int"), F.lit(0))     # prediction 0/1
+
+def eval_slice(df):
+    agg = df.agg(
+        F.count("*").alias("total"),
+        F.sum(yhat).alias("alerts"),
+        F.sum(y).alias("actual_fraud"),
+        F.sum(F.when((yhat == 1) & (y == 1), 1).otherwise(0)).alias("tp"),
+        F.sum(F.when((yhat == 1) & (y == 0), 1).otherwise(0)).alias("fp"),
+        F.sum(F.when((yhat == 0) & (y == 1), 1).otherwise(0)).alias("fn"),
+        F.sum(F.when((yhat == 0) & (y == 0), 1).otherwise(0)).alias("tn"),
+    )
+
+    return (agg
+        .withColumn("precision",  safe_div(F.col("tp"), F.col("tp")+F.col("fp")))
+        .withColumn("recall",     safe_div(F.col("tp"), F.col("tp")+F.col("fn")))
+        .withColumn("f1",         safe_div(2*F.col("precision")*F.col("recall"),
+                                           F.col("precision")+F.col("recall")))
+        .withColumn("accuracy",   safe_div(F.col("tp")+F.col("tn"), F.col("total")))
+        .withColumn("alert_rate", safe_div(F.col("alerts"), F.col("total")))
+        .withColumn("fraud_rate", safe_div(F.col("actual_fraud"), F.col("total")))
+        .withColumn("lift",       safe_div(F.col("precision"), F.col("fraud_rate")))
+    )
+
+# All-time
+eval_slice(S).show(truncate=False)
+
+# Specific day
+eval_slice(S.where(F.col("proc_date") == F.to_date(F.lit("2025-01-18")))).show(truncate=False)
+
+# Per-day rollup
+per_day = (S.groupBy("proc_date").agg(
+            F.count("*").alias("total"),
+            F.sum(yhat).alias("alerts"),
+            F.sum(y).alias("actual_fraud"),
+            F.sum(F.when((yhat == 1) & (y == 1), 1).otherwise(0)).alias("tp"),
+            F.sum(F.when((yhat == 1) & (y == 0), 1).otherwise(0)).alias("fp"),
+            F.sum(F.when((yhat == 0) & (y == 1), 1).otherwise(0)).alias("fn"),
+          )
+          .withColumn("precision",  safe_div(F.col("tp"), F.col("tp")+F.col("fp")))
+          .withColumn("recall",     safe_div(F.col("tp"), F.col("tp")+F.col("fn")))
+          .withColumn("alert_rate", safe_div(F.col("alerts"), F.col("total")))
+          .withColumn("fraud_rate", safe_div(F.col("actual_fraud"), F.col("total")))
+          .orderBy("proc_date"))
+per_day.show(100, truncate=False)
+
+
+# === Cell 7: Build & save drift baseline from historical window (PATH-only) ===
+from pyspark.sql import functions as F
+import json
+
+# Paths (reuse your existing ACCOUNT / CONTAINER / scores_stream_path)
+baseline_path      = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/drift_baseline"
+drift_events_path  = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/drift_events"
+model_control_path = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/model_control"
+
+# Choose a stable window you trust for baseline
+BASE_START = "2025-01-01"
+BASE_END   = "2025-01-15"
+
+# Features to watch (model inputs + p_fraud)
+watch_cols = [
+  "TX_AMOUNT_D","distance_km","hour_of_day","day_of_week","is_weekend",
+  "cust_txn_2m","cust_txn_5m","term_fraud_rate_7d","term_txn_7d",
+  "cust_amt_med_30d","cust_amt_iqr_30d","amt_vs_med","p_fraud"
+]
+
+scores_df = spark.read.format("delta").load(scores_stream_path)
+
+base = (scores_df
+        .where((F.col("proc_date")>=F.lit(BASE_START)) & (F.col("proc_date")<=F.lit(BASE_END)))
+        .select(*[c for c in watch_cols if c in scores_df.columns]))
+
+NUM_BINS = 10
+
+def build_bins(colname):
+    qs = [i/NUM_BINS for i in range(NUM_BINS+1)]
+    edges = base.approxQuantile(colname, qs, 1e-3)
+    if not edges:
+        return [0.0, 1.0, 2.0]
+    uniq = [edges[0]]
+    for e in edges[1:]:
+        if e > uniq[-1]:
+            uniq.append(e)
+    if len(uniq) < 3:
+        uniq = [float(uniq[0]), float(uniq[0])+1.0, float(uniq[0])+2.0]
+    return uniq
+
+rows = []
+total = base.count()
+for c in watch_cols:
+    if c not in base.columns:
+        continue
+    edges = build_bins(c)
+    # bin current column
+    conds = []
+    for i in range(len(edges)-1):
+        left, right = edges[i], edges[i+1]
+        if i < len(edges)-2:
+            conds.append(F.when((F.col(c)>=left) & (F.col(c)<right), F.lit(i)))
+        else:
+            conds.append(F.when((F.col(c)>=left) & (F.col(c)<=right), F.lit(i)))
+    binned = base.select(F.coalesce(*conds).alias("bin")).groupBy("bin").count()
+    dist = {str(int(r["bin"])): (r["count"]/total) for r in binned.collect() if r["bin"] is not None}
+    for i in range(len(edges)-1):
+        dist.setdefault(str(i), 1e-8)  # avoid zero
+    rows.append((c, json.dumps(edges), json.dumps(dist)))
+
+baseline_df = spark.createDataFrame(rows, ["feature","bin_edges_json","expected_json"]) \
+                   .withColumn("created_at", F.current_timestamp())
+
+baseline_df.write.format("delta").mode("overwrite").save(baseline_path)
+print("Baseline saved to", baseline_path)
+
+
+# === Cell 8: Drift monitor stream — compute PSI per micro-batch to path (PATH-only) ===
+import json, math
+from pyspark.sql import functions as F
+
+baseline_path     = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/drift_baseline"
+drift_events_path = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/drift_events"
+
+watch_cols = [
+  "TX_AMOUNT_D","distance_km","hour_of_day","day_of_week","is_weekend",
+  "cust_txn_2m","cust_txn_5m","term_fraud_rate_7d","term_txn_7d",
+  "cust_amt_med_30d","cust_amt_iqr_30d","amt_vs_med","p_fraud"
+]
+
+PSI_THRESH_FEATURE = 0.2
+PSI_THRESH_SCORE   = 0.2
+
+def psi_from_bins(expected_dict, observed_dict):
+    psi = 0.0
+    for k, e in expected_dict.items():
+        o = observed_dict.get(k, 1e-8)
+        e = max(e, 1e-8)
+        o = max(o, 1e-8)
+        psi += (o - e) * math.log(o / e)
+    return float(psi)
+
+baseline_df = spark.read.format("delta").load(baseline_path).cache()
+
+def compute_psis(microdf):
+    rows = []
+    total = microdf.count()
+    if total == 0:
+        return rows
+    bl = baseline_df.collect()  # small dimension; safe to collect
+    for row in bl:
+        feat = row["feature"]
+        if feat not in microdf.columns:
+            continue
+        edges = json.loads(row["bin_edges_json"])
+        exp   = json.loads(row["expected_json"])
+
+        conds = []
+        for i in range(len(edges)-1):
+            left, right = edges[i], edges[i+1]
+            if i < len(edges)-2:
+                conds.append(F.when((F.col(feat)>=left) & (F.col(feat)<right), F.lit(i)))
+            else:
+                conds.append(F.when((F.col(feat)>=left) & (F.col(feat)<=right), F.lit(i)))
+        binned = microdf.select(F.coalesce(*conds).alias("bin")).groupBy("bin").count()
+        obs = {str(int(r["bin"])): (r["count"]/total) for r in binned.collect() if r["bin"] is not None}
+        for i in range(len(edges)-1):
+            obs.setdefault(str(i), 1e-8)
+
+        psi = psi_from_bins(exp, obs)
+        severity = (
+            "severe" if (feat=="p_fraud" and psi>=PSI_THRESH_SCORE) or (feat!="p_fraud" and psi>=PSI_THRESH_FEATURE)
+            else ("moderate" if psi>=0.1 else "none")
+        )
+        rows.append((feat, float(psi), severity, json.dumps(obs)))
+    return rows
+
+def drift_foreach_batch(batch_df, batch_id: int):
+    cols = [c for c in watch_cols if c in batch_df.columns]
+    if not cols:
+        return
+    out_rows = compute_psis(batch_df.select(*cols))
+    if out_rows:
+        out_df = spark.createDataFrame(out_rows, ["feature","psi","severity","observed_json"]) \
+                      .withColumn("ts", F.current_timestamp()) \
+                      .withColumn("batch_id", F.lit(batch_id))
+        out_df.write.format("delta").mode("append").save(drift_events_path)
+
+chkpt_drift = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/_chk/drift_monitor_v1"
+
+drift_stream = (spark.readStream
+  .format("delta")
+  .load(scores_stream_path)                 # consume your scored rows
+  .writeStream
+  .queryName("drift_monitor")
+  .option("checkpointLocation", chkpt_drift)
+  .trigger(processingTime="1 minute")
+  .foreachBatch(drift_foreach_batch)
+  .start())
+
+print("Drift monitor stream started.")
+
+
+# === Cell 9: Performance monitor — precision/recall to path (PATH-only) ===
+from pyspark.sql import functions as F
+
+model_control_path = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/model_control"
+
+def perf_foreach_batch(batch_df, batch_id: int):
+    df = (batch_df
+          .select("is_alert","TX_FRAUD")    # needs labels present (even if delayed)
+          .filter(F.col("TX_FRAUD").isNotNull()))
+    total = df.count()
+    if total == 0:
+        return
+
+    tp = df.filter((F.col("is_alert")==1) & (F.col("TX_FRAUD")==1)).count()
+    fp = df.filter((F.col("is_alert")==1) & (F.col("TX_FRAUD")==0)).count()
+    fn = df.filter((F.col("is_alert")==0) & (F.col("TX_FRAUD")==1)).count()
+
+    precision = (tp / max(tp+fp, 1)) if (tp+fp)>0 else None
+    recall    = (tp / max(tp+fn, 1)) if (tp+fn)>0 else None
+    should_retrain = 1 if (precision is not None and precision < 0.6) else 0
+
+    ctl = spark.createDataFrame([(
+        int(batch_id), int(total), int(tp), int(fp), int(fn),
+        float(precision) if precision is not None else None,
+        float(recall)    if recall    is not None else None,
+        int(should_retrain)
+    )], schema="batch_id long, total long, tp long, fp long, fn long, precision double, recall double, retrain_needed int") \
+    .withColumn("ts", F.current_timestamp())
+
+    ctl.write.format("delta").mode("append").save(model_control_path)
+
+chkpt_perf = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/_chk/perf_monitor_v1"
+
+perf_stream = (spark.readStream
+  .format("delta")
+  .load(scores_stream_path)
+  .writeStream
+  .queryName("perf_monitor")
+  .option("checkpointLocation", chkpt_perf)
+  .trigger(processingTime="5 minutes")
+  .foreachBatch(perf_foreach_batch)
+  .start())
+
+print("Performance monitor stream started.")
+
+
+for q in spark.streams.active:
+    print(f"\n=== {q.name} ===")
+    print("id:", q.id)
+    print("isActive:", q.isActive)
+    st = q.status
+    print("status:", st.get("message"), "| dataAvailable:", st.get("isDataAvailable"), "| triggerActive:", st.get("isTriggerActive"))
+    lp = q.lastProgress or {}
+    if lp:
+        print("batchId:", lp.get("batchId"))
+        # sources
+        for s in lp.get("sources", []):
+            print("  source:", s.get("description"), "| numInputRows:", lp.get("numInputRows"))
+        # sink
+        if lp.get("sink"):
+            print("  sink:", lp["sink"].get("description"))
+    else:
+        print("No lastProgress yet.")
+
+
+
+drift_events_path = f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/drift_events"
+model_control_path= f"abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/gold/model_control"
+
+drift = spark.read.format("delta").load(drift_events_path)
+ctrl  = spark.read.format("delta").load(model_control_path)
+
+print("drift rows:", drift.count())
+drift.orderBy(F.col("ts").desc(), F.col("feature")).select("ts","batch_id","feature","psi","severity").show(50, False)
+
+print("control rows:", ctrl.count())
+ctrl.orderBy(F.col("ts").desc()).select("ts","batch_id","precision","recall","retrain_needed","total","tp","fp","fn").show(50, False)
+
+
+for q in spark.streams.active:
+    print("stopping:", q.name, q.id)
+    q.stop()

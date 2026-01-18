@@ -1,0 +1,222 @@
+### Data Loading
+
+spark.conf.set(
+    "fs.azure.account.key.azmlstoragedatalake.dfs.core.windows.net",
+    "9QTdwB1LF0OdYHEeQO/m1KdriqEHVoqruUyHHtS2WNNaFRUiYmpAnlPXgTkukBHMwSf8B3BQgxbQ+AStpuBZNw=="
+)
+display(
+    dbutils.fs.ls("abfss://raw@azmlstoragedatalake.dfs.core.windows.net/bronze/transactions/")
+)
+
+df = (spark.read
+      .option("header", True)\
+        .option("inferSchema", True)\
+        .option("delimiter", ",")\
+      .csv("abfss://raw@azmlstoragedatalake.dfs.core.windows.net/bronze/transactions/yyyy=2025/mm=01/dd=03/*.csv"))
+df.show(5, truncate=False)
+
+from pyspark.sql import functions as F, types as T, Window
+import math
+
+bronze_root = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/bronze/transactions"
+silver_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+
+# UC-safe: read root; Spark infers partition cols (yyyy, mm, dd) automatically
+df_bz = (spark.read
+         .option("header", True)
+         .csv(bronze_root))   # <-- no globs, no recursiveFileLookup
+
+df_bz.printSchema()  
+
+
+# ---- your casts/derivations (unchanged) ----
+def _hav(lat1, lon1, lat2, lon2):
+    import math
+    if None in (lat1,lon1,lat2,lon2): return None
+    R=6371.0; φ1,φ2=map(math.radians,[lat1,lat2])
+    dφ=math.radians(lat2-lat1); dλ=math.radians(lon2-lon1)
+    a=math.sin(dφ/2)**2+math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
+    return 2*R*math.asin(math.sqrt(a))
+
+hav = F.udf(_hav, T.DoubleType())
+
+df = (
+  df_bz
+  .withColumn("TRANSACTION_ID", F.upper(F.trim("TRANSACTION_ID")).cast(T.StringType()))
+  .withColumn("TX_DATETIME",    F.to_timestamp("TX_DATETIME"))
+  .withColumn("TX_TIME_SECONDS",F.col("TX_TIME_SECONDS").cast(T.IntegerType()))
+  .withColumn("TX_TIME_DAYS",   F.col("TX_TIME_DAYS").cast(T.IntegerType()))
+  .withColumn("CUSTOMER_ID",    F.upper(F.trim("CUSTOMER_ID")).cast(T.StringType()))
+  .withColumn("TERMINAL_ID",    F.upper(F.trim("TERMINAL_ID")).cast(T.StringType()))
+  .withColumn("TX_AMOUNT",      F.round(F.col("TX_AMOUNT").cast(T.DecimalType(12,2)), 2))
+  .withColumn("TX_FRAUD",       F.col("TX_FRAUD").cast(T.IntegerType()))
+  .withColumn("TX_FRAUD_SCENARIO", F.col("TX_FRAUD_SCENARIO").cast(T.StringType()))
+  .withColumn("CUSTOMER_LAT",   F.col("CUSTOMER_LAT").cast(T.DoubleType()))
+  .withColumn("CUSTOMER_LON",   F.col("CUSTOMER_LON").cast(T.DoubleType()))
+  .withColumn("TERMINAL_LAT",   F.col("TERMINAL_LAT").cast(T.DoubleType()))
+  .withColumn("TERMINAL_LON",   F.col("TERMINAL_LON").cast(T.DoubleType()))
+  .withColumn("event_time",     F.col("TX_DATETIME"))
+  .withColumn("distance_km",    hav("CUSTOMER_LAT","CUSTOMER_LON","TERMINAL_LAT","TERMINAL_LON"))
+  .withColumn("hour_of_day",    F.hour("event_time"))
+  .withColumn("day_of_week",    F.dayofweek("event_time"))
+  .withColumn("is_weekend",     ((F.col("day_of_week") == 7) | (F.col("day_of_week") == 1)).cast("boolean"))
+)
+
+
+from pyspark.sql import Window
+w = Window.partitionBy("TRANSACTION_ID").orderBy(F.col("event_time").desc_nulls_last())
+df = df.withColumn("_rn", F.row_number().over(w)).filter("_rn = 1").drop("_rn")
+
+(df.write
+   .format("delta")
+   .mode("overwrite")                 # first full load only
+   .partitionBy("yyyy","mm","dd")
+   .save(silver_path))
+   
+   
+df.display(10)
+
+from pyspark.sql import functions as F
+
+silver_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+
+yyyymmdd = "20250101"
+yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+
+sdf = (spark.read.format("delta").load(silver_path)
+       .where( (F.col("yyyy")==yyyy) & (F.col("mm")==mm) & (F.col("dd")==dd) ))
+
+# …then run the DQ checks on sdf (same code as before) …
+
+
+viol = (sdf.select(
+          F.sum(F.when(F.col("TRANSACTION_ID").isNull(), 1).otherwise(0)).alias("null_pk"),
+          F.sum(F.when((F.col("TX_TIME_SECONDS") < 0) | (F.col("TX_TIME_SECONDS") > 86399), 1).otherwise(0)).alias("bad_time"),
+          F.sum(F.when((F.col("TX_AMOUNT") <= 0) | (F.col("TX_AMOUNT") > 8000), 1).otherwise(0)).alias("bad_amount"),
+          F.sum(F.when(F.col("CUSTOMER_LAT").isNull() | F.col("TERMINAL_LAT").isNull(), 1).otherwise(0)).alias("null_geo")
+        ).collect()[0].asDict())
+
+checks = {
+  "non_null_pk": viol["null_pk"]  == 0,
+  "time_range":  viol["bad_time"] == 0,
+  "amount_range":viol["bad_amount"] == 0,
+  "latlon_nulls":viol["null_geo"] == 0
+}
+
+print(checks)
+if not all(checks.values()):
+    raise Exception(f"DQ failed for {yyyymmdd}: {checks}")
+else:
+    print(f"DQ passed for {yyyymmdd} with {sdf.count()} rows")
+	
+
+%sql
+show catalogs
+
+from pyspark.sql import functions as F
+silver_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+
+tx = spark.read.format("delta").load(silver_path)
+
+
+# ---- Customer snapshot (latest coordinates per customer) ----
+cust_snap = (tx
+  .groupBy("CUSTOMER_ID")
+  .agg(
+    F.first("CUSTOMER_LAT", ignorenulls=True).alias("CUSTOMER_LAT"),
+    F.first("CUSTOMER_LON", ignorenulls=True).alias("CUSTOMER_LON"),
+    F.min("event_time").alias("first_seen_ts"),
+    F.max("event_time").alias("last_seen_ts"),
+  )
+)
+
+cust_snap.write.mode("overwrite").format("delta").saveAsTable("fraud_detection_project.fraud.silver_customers")
+
+# ---- Terminal snapshot (latest coordinates per terminal) ----
+term_snap = (tx
+  .groupBy("TERMINAL_ID")
+  .agg(
+    F.first("TERMINAL_LAT", ignorenulls=True).alias("TERMINAL_LAT"),
+    F.first("TERMINAL_LON", ignorenulls=True).alias("TERMINAL_LON"),
+    F.min("event_time").alias("first_seen_ts"),
+    F.max("event_time").alias("last_seen_ts"),
+  )
+)
+
+term_snap.write.mode("overwrite").format("delta").saveAsTable("fraud_detection_project.fraud.silver_terminals")
+
+
+
+from pyspark.sql import functions as F
+silver_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions"
+tx = spark.read.format("delta").load("abfss://raw@azmlstoragedatalake.dfs.core.windows.net/silver/transactions")
+tx.write.mode("overwrite").format("delta").saveAsTable("fraud_detection_project.fraud.silver_transactions")
+
+
+
+from pyspark.sql import functions as F
+
+# ---- params ----
+dbutils.widgets.text("yyyymmdd", "20250101")
+yyyymmdd = dbutils.widgets.get("yyyymmdd")
+yyyy, mm, dd = yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]
+
+# ---- read one day from Silver ----
+tx_day = (spark.table("fraud_detection_project.fraud.silver_transactions")
+          .where((F.col("yyyy")==yyyy) & (F.col("mm")==mm) & (F.col("dd")==dd)))
+
+# ---- customers ----
+cust_incr = (tx_day.groupBy("CUSTOMER_ID")
+  .agg(
+    F.first("CUSTOMER_LAT", True).alias("CUSTOMER_LAT"),
+    F.first("CUSTOMER_LON", True).alias("CUSTOMER_LON"),
+    F.min("event_time").alias("first_seen_ts_incr"),
+    F.max("event_time").alias("last_seen_ts_incr"),
+  ))
+cust_incr.createOrReplaceTempView("cust_incr")
+
+spark.sql("""
+MERGE INTO fraud_detection_project.fraud.silver_customers AS T
+USING (SELECT * FROM cust_incr) AS S
+ON T.CUSTOMER_ID = S.CUSTOMER_ID
+WHEN MATCHED THEN UPDATE SET
+  T.CUSTOMER_LAT = COALESCE(S.CUSTOMER_LAT, T.CUSTOMER_LAT),
+  T.CUSTOMER_LON = COALESCE(S.CUSTOMER_LON, T.CUSTOMER_LON),
+  T.first_seen_ts = LEAST(T.first_seen_ts, S.first_seen_ts_incr),
+  T.last_seen_ts  = GREATEST(T.last_seen_ts, S.last_seen_ts_incr)
+WHEN NOT MATCHED THEN INSERT (
+  CUSTOMER_ID, CUSTOMER_LAT, CUSTOMER_LON, first_seen_ts, last_seen_ts
+) VALUES (
+  S.CUSTOMER_ID, S.CUSTOMER_LAT, S.CUSTOMER_LON, S.first_seen_ts_incr, S.last_seen_ts_incr
+)
+""")
+
+# ---- terminals ----
+term_incr = (tx_day.groupBy("TERMINAL_ID")
+  .agg(
+    F.first("TERMINAL_LAT", True).alias("TERMINAL_LAT"),
+    F.first("TERMINAL_LON", True).alias("TERMINAL_LON"),
+    F.min("event_time").alias("first_seen_ts_incr"),
+    F.max("event_time").alias("last_seen_ts_incr"),
+  ))
+term_incr.createOrReplaceTempView("term_incr")
+
+spark.sql("""
+MERGE INTO fraud_detection_project.fraud.silver_terminals AS T
+USING (SELECT * FROM term_incr) AS S
+ON T.TERMINAL_ID = S.TERMINAL_ID
+WHEN MATCHED THEN UPDATE SET
+  T.TERMINAL_LAT = COALESCE(S.TERMINAL_LAT, T.TERMINAL_LAT),
+  T.TERMINAL_LON = COALESCE(S.TERMINAL_LON, T.TERMINAL_LON),
+  T.first_seen_ts = LEAST(T.first_seen_ts, S.first_seen_ts_incr),
+  T.last_seen_ts  = GREATEST(T.last_seen_ts, S.last_seen_ts_incr)
+WHEN NOT MATCHED THEN INSERT (
+  TERMINAL_ID, TERMINAL_LAT, TERMINAL_LON, first_seen_ts, last_seen_ts
+) VALUES (
+  S.TERMINAL_ID, S.TERMINAL_LAT, S.TERMINAL_LON, S.first_seen_ts_incr, S.last_seen_ts_incr
+)
+""")
+
+print(f"Dims upserted for {yyyymmdd}")
+
+

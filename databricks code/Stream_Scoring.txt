@@ -1,0 +1,337 @@
+from pyspark.sql import functions as F, types as T
+
+# ── Widgets (set in Job/Run) ───────────────────────────────────────────────────
+dbutils.widgets.text("adls_auth_type", "sas")        # sas | account_key
+dbutils.widgets.text("adls_secret", "")              # SAS token w/o '?' OR account key
+dbutils.widgets.text("include_existing", "true")     # true to backfill existing bronze files
+
+auth_type        = dbutils.widgets.get("adls_auth_type")
+secret           = dbutils.widgets.get("adls_secret")
+include_existing = dbutils.widgets.get("include_existing").lower() == "true"
+
+if not secret:
+    raise Exception("Missing ADLS secret widget. Paste SAS (without '?') or account key.")
+
+# ── Storage locations ──────────────────────────────────────────────────────────
+account   = "azmlstoragedatalake"
+container = "raw"
+
+bronze_root        = f"abfss://{container}@{account}.dfs.core.windows.net/bronze/transactions"
+lookup_cust_path   = f"abfss://{container}@{account}.dfs.core.windows.net/gold/lookup_cust_amount_stats"
+lookup_term_path   = f"abfss://{container}@{account}.dfs.core.windows.net/gold/lookup_term_7d"
+model_path         = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1"
+meta_path          = f"abfss://{container}@{account}.dfs.core.windows.net/models/fraud_trad_v1_meta"
+scores_stream_path = f"abfss://{container}@{account}.dfs.core.windows.net/gold/stream_scores"
+alerts_stream_path = f"abfss://{container}@{account}.dfs.core.windows.net/gold/stream_alerts"
+checkpoint_dir     = f"abfss://{container}@{account}.dfs.core.windows.net/_chk/stream_scoring_v1"
+
+# ── Mountless auth (per-run) ───────────────────────────────────────────────────
+if auth_type == "sas":
+    spark.conf.set(f"fs.azure.sas.token.provider.type.{account}.dfs.core.windows.net",
+                   "org.apache.hadoop.fs.azurebfs.sas.FixedSASTokenProvider")
+    spark.conf.set(f"fs.azure.sas.fixed.token.{account}.dfs.core.windows.net", secret)
+elif auth_type == "account_key":
+    spark.conf.set(f"fs.azure.account.key.{account}.dfs.core.windows.net", secret)
+else:
+    raise Exception("Unsupported adls_auth_type")
+	
+	
+from pyspark.ml.pipeline import PipelineModel
+
+# model & meta
+model = PipelineModel.load(model_path)
+meta  = spark.read.format("delta").load(meta_path).limit(1).collect()[0].asDict()
+thr        = float(meta["threshold"])
+features   = meta["features"].split(",")
+
+# latest daily snapshots
+cust_all = spark.read.format("delta").load(lookup_cust_path)
+term_all = spark.read.format("delta").load(lookup_term_path)
+
+latest_cust_date = cust_all.agg(F.max("as_of_date")).first()[0]
+latest_term_date = term_all.agg(F.max("as_of_date")).first()[0]
+
+cust_snap = (cust_all.where(F.col("as_of_date")==latest_cust_date)
+             .select("CUSTOMER_ID","cust_amt_med_30d","cust_amt_iqr_30d"))
+term_snap = (term_all.where(F.col("as_of_date")==latest_term_date)
+             .select("TERMINAL_ID","term_fraud_rate_7d","term_txn_7d"))
+
+print("Loaded model @thr:", thr, "| lookups as_of:", latest_cust_date, latest_term_date)
+
+
+
+# Schema of incoming CSV (match your simulator/bronze files)
+schema = T.StructType([
+    T.StructField("TRANSACTION_ID", T.StringType()),
+    T.StructField("TX_DATETIME",    T.StringType()),     # ISO string
+    T.StructField("TX_TIME_SECONDS",T.IntegerType()),
+    T.StructField("TX_TIME_DAYS",   T.IntegerType()),
+    T.StructField("CUSTOMER_ID",    T.StringType()),
+    T.StructField("TERMINAL_ID",    T.StringType()),
+    T.StructField("TX_AMOUNT",      T.DoubleType()),
+    T.StructField("TX_FRAUD",       T.IntegerType()),    # present in replay; null in prod
+    T.StructField("TX_FRAUD_SCENARIO", T.StringType()),
+    T.StructField("CUSTOMER_LAT",   T.DoubleType()),
+    T.StructField("CUSTOMER_LON",   T.DoubleType()),
+    T.StructField("TERMINAL_LAT",   T.DoubleType()),
+    T.StructField("TERMINAL_LON",   T.DoubleType()),
+])
+
+# Auto Loader source
+stream_src = (
+  spark.readStream
+       .format("cloudFiles")
+       .option("cloudFiles.format","csv")
+       .option("header","true")
+       .option("cloudFiles.inferColumnTypes","false")
+       .option("cloudFiles.schemaLocation", checkpoint_dir + "_schema")   # schema evolution tracking
+       .option("cloudFiles.includeExistingFiles", str(include_existing).lower())
+       .schema(schema)
+       .load(bronze_root)
+       .withColumn("event_time", F.to_timestamp("TX_DATETIME"))           # cast early
+)
+
+
+import math
+@F.udf("double")
+def haversine_km(lat1, lon1, lat2, lon2):
+    try:
+        R=6371.0
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2-lat1)
+        dl   = math.radians(lon2-lon1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+        return 2*R*math.asin(math.sqrt(a))
+    except Exception:
+        return None
+
+
+
+
+def score_batch(batch_df, batch_id):
+    from pyspark.sql import Window
+    from pyspark.ml.functions import vector_to_array
+    from pyspark.sql import functions as F
+    if batch_df.rdd.isEmpty():
+        return
+
+    df = (batch_df
+          .withColumn("event_time", F.col("event_time").cast("timestamp"))
+          .withColumn("hour_of_day", F.hour("event_time"))
+          # ---- replace date_format("u") with dayofweek() remap to ISO ----
+          # Spark dayofweek: 1=Sun ... 7=Sat  -> ISO: 1=Mon ... 7=Sun
+          .withColumn("_dow_sun1", F.dayofweek("event_time"))                    # 1..7
+          .withColumn("day_of_week", (((F.col("_dow_sun1") + 5) % 7) + 1))       # 1..7 (Mon..Sun)
+          .drop("_dow_sun1")
+          .withColumn("is_weekend", F.when(F.col("day_of_week").isin(6,7), F.lit(1.0)).otherwise(F.lit(0.0)))
+          .withColumn("TX_AMOUNT_D", F.col("TX_AMOUNT").cast("double"))
+         )
+
+    # distance
+    df = df.withColumn("distance_km", haversine_km("CUSTOMER_LAT","CUSTOMER_LON","TERMINAL_LAT","TERMINAL_LON"))
+
+    # velocity (micro-batch approximation)
+    df = df.withColumn("_ts", F.col("event_time").cast("long"))
+    w2m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-120, -1)
+    w5m = Window.partitionBy("CUSTOMER_ID").orderBy("_ts").rangeBetween(-300, -1)
+    df = (df
+          .withColumn("cust_txn_2m", F.count("*").over(w2m))
+          .withColumn("cust_txn_5m", F.count("*").over(w5m))
+         )
+
+    # join daily lookups
+    df = (df.join(F.broadcast(cust_snap), on="CUSTOMER_ID", how="left")
+            .join(F.broadcast(term_snap), on="TERMINAL_ID",  how="left"))
+
+    # feature hygiene (types + NULL/NaN guards)
+    doubles = {
+      "TX_AMOUNT_D":0.0, "distance_km":0.0, "is_weekend":0.0,
+      "cust_amt_med_30d":0.0, "cust_amt_iqr_30d":0.0, "term_fraud_rate_7d":0.0
+    }
+    ints = {"hour_of_day":0, "day_of_week":1, "cust_txn_2m":0, "cust_txn_5m":0, "term_txn_7d":0}
+
+    for c,d in doubles.items():
+        if c in df.columns:
+            df = df.withColumn(c, F.col(c).cast("double"))
+            df = df.withColumn(c, F.coalesce(F.col(c), F.lit(d)))
+            df = df.withColumn(c, F.when(F.isnan(F.col(c)), F.lit(d)).otherwise(F.col(c)))
+
+    for c,d in ints.items():
+        if c in df.columns:
+            df = df.withColumn(c, F.coalesce(F.col(c).cast("int"), F.lit(d)))
+
+    # amt_vs_med (derived)
+    df = df.withColumn(
+        "amt_vs_med",
+        F.when(F.col("cust_amt_med_30d") > 0, F.col("TX_AMOUNT_D")/F.col("cust_amt_med_30d")).otherwise(F.lit(1.0))
+    )
+
+    # model scoring
+    scored = (model.transform(df)
+              .withColumn("p_fraud_raw", vector_to_array("probability").getItem(1))
+              .withColumn("p_fraud",
+                          F.when(F.col("p_fraud_raw").isNull() | F.isnan(F.col("p_fraud_raw")), F.lit(0.0))
+                           .otherwise(F.col("p_fraud_raw")))
+              .drop("p_fraud_raw")
+              .withColumn("is_alert", (F.col("p_fraud") >= F.lit(thr)).cast("int"))
+             )
+
+    # ---- build output without duplicate columns ----
+    base_cols = [
+        "TRANSACTION_ID","CUSTOMER_ID","TERMINAL_ID","event_time",
+        "TX_AMOUNT_D","p_fraud","is_alert","TX_FRAUD"   # TX_FRAUD null in real-time
+    ]
+
+    out_pref = scored.withColumn("proc_date", F.to_date("event_time"))
+
+    # de-duplicate features (case-insensitive) vs base_cols + proc_date
+    already = set(c.lower() for c in base_cols + ["proc_date"])
+    features_nodup = [c for c in features if c.lower() not in already]
+
+    out = out_pref.select(*(base_cols + features_nodup + ["proc_date"]))
+
+    # append to Delta sinks
+    (out.write.format("delta").mode("append").save(scores_stream_path))
+
+    alerts = out.where("is_alert = 1") \
+                .select("TRANSACTION_ID","CUSTOMER_ID","TERMINAL_ID","event_time","TX_AMOUNT_D","p_fraud","proc_date")
+    # ---- LIVE DEMO PRINT: show alerts for this micro-batch ----
+
+    alerts_pretty = (alerts
+        .orderBy(F.desc("p_fraud"))
+        .select(
+            "event_time",
+            "TRANSACTION_ID",
+            "CUSTOMER_ID",
+            "TERMINAL_ID",
+            F.round("TX_AMOUNT_D", 2).alias("amount"),
+            F.round("p_fraud", 4).alias("p_fraud")
+        ))
+
+    cnt = alerts_pretty.count()
+    print(f"\n[batch {batch_id}] ALERTS = {cnt}")
+    if cnt > 0:
+        alerts_pretty.show(min(cnt, 50), truncate=False)   # prints up to 50 newest alerts
+
+
+    (alerts.write.format("delta").mode("append").save(alerts_stream_path))
+
+
+# Start the scoring stream
+query = (stream_src
+   .writeStream
+   .foreachBatch(score_batch)
+   .option("checkpointLocation", checkpoint_dir)
+   .trigger(processingTime="30 seconds")        # or "10 seconds"
+   .start())
+
+print("Streaming started.")
+
+
+import json
+
+def jprint(x):
+    try:
+        print(json.dumps(x, indent=2, default=str))
+    except Exception:
+        print(x)
+
+# Stream health
+print("Active:", query.isActive)
+jprint(query.status)
+
+lp = query.lastProgress
+jprint(lp)  # safe even if it contains UUIDs
+
+# Derived numbers from last batch
+if lp:
+    nrows = sum(int(s.get("numInputRows", 0)) for s in lp.get("sources", []))
+    print("Last batch:", lp.get("timestamp"), "| input rows:", nrows)
+
+# Recent batches (mini timeline)
+for p in (query.recentProgress or []):
+    rows = (p.get("sources") or [{}])[0].get("numInputRows", 0)
+    print(p.get("timestamp"), "rows:", rows)
+
+
+from pyspark.sql import functions as F
+
+scores_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/stream_scores"
+alerts_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/stream_alerts"
+
+sc = spark.read.format("delta").load(scores_path)
+al = spark.read.format("delta").load(alerts_path)
+print("scores total:", sc.count(), "| alerts total:", al.count())
+
+# today (adjust date)
+sc.where((F.col("event_time")>=F.lit("2025-01-15")) &
+         (F.col("event_time")< F.lit("2025-01-16"))).count()
+
+if 'query' in globals():
+    query.stop()
+    print("Stopped stream.")
+
+
+scores_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/stream_scores"
+alerts_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/stream_alerts"
+
+from pyspark.sql import functions as F
+sc = spark.read.format("delta").load(scores_path)
+al = spark.read.format("delta").load(alerts_path)
+
+sc.where(F.to_date("proc_date")==F.to_date(F.lit("2025-01-15"))).count()
+al.where(F.to_date("proc_date")==F.to_date(F.lit("2025-01-15"))).orderBy(F.desc("p_fraud")).show(10, False)
+
+
+scores_path = "abfss://raw@azmlstoragedatalake.dfs.core.windows.net/gold/stream_scores"
+from pyspark.sql import functions as F
+sc = spark.read.format("delta").load(scores_path)
+
+(sc.groupBy("proc_date").agg(F.count("*").alias("rows")).orderBy("proc_date").show(50, False))
+
+
+from pyspark.sql import functions as F
+
+sc = spark.read.format("delta").load(scores_stream_path)
+al = spark.read.format("delta").load(alerts_stream_path)
+
+# 1) Confirm predictions & labels are present
+sc.orderBy(F.desc("proc_date")).select("event_time","p_fraud","is_alert","TX_FRAUD").show(20, False)
+
+# 2) Are alerts driven by the model threshold?
+al.orderBy(F.desc("proc_date")).select("event_time","p_fraud").show(20, False)
+
+# 3) See threshold distribution around your meta threshold
+thr = 0.0  # (replace with meta["threshold"] you printed)
+sc.select(
+  F.expr(f"sum(case when p_fraud >= {thr} then 1 else 0 end) as above_thr"),
+  F.count("*").alias("total")
+).show()
+
+
+from pyspark.sql import functions as F
+
+thr = float(meta["threshold"])  # e.g., meta.select("threshold").first()[0]
+
+sc = spark.read.format("delta").load(scores_path)
+al = spark.read.format("delta").load(alerts_path)
+
+# 1) How many are above the *real* threshold?
+sc.select(
+  F.sum(F.when(F.col("p_fraud") >= F.lit(thr), 1).otherwise(0)).alias("above_thr"),
+  F.count("*").alias("total")
+).show()
+
+# 2) Do alerts line up with scores >= threshold?
+al.groupBy(F.to_date("event_time").alias("d")).count().orderBy("d").show()
+sc.where(F.col("p_fraud") >= F.lit(thr)).groupBy(F.to_date("event_time")).count().orderBy("to_date(event_time)").show()
+
+# 3) Quick confusion matrix by day (using simulator label)
+sc.groupBy(F.to_date("event_time").alias("d")).agg(
+    F.sum(F.when((F.col("p_fraud") >= thr) & (F.col("TX_FRAUD")==1), 1).otherwise(0)).alias("TP"),
+    F.sum(F.when((F.col("p_fraud") >= thr) & (F.col("TX_FRAUD")==0), 1).otherwise(0)).alias("FP"),
+    F.sum(F.when((F.col("p_fraud") <  thr) & (F.col("TX_FRAUD")==0), 1).otherwise(0)).alias("TN"),
+    F.sum(F.when((F.col("p_fraud") <  thr) & (F.col("TX_FRAUD")==1), 1).otherwise(0)).alias("FN")
+).orderBy("d").show(50, False)
+
+
